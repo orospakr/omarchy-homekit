@@ -223,6 +223,135 @@ function sceneSubtitle(scene) {
   return scene.actionCount + " action" + (scene.actionCount === 1 ? "" : "s") + " · " + rooms
 }
 
+// ------------------------------------------------------ render projections
+//
+// The panel renders ListModels, not these JS arrays: reassigning an array to a
+// Repeater destroys and recreates every delegate, which flickers and collapses
+// the content column so the Flickable clamps the scroll position away. Writes
+// here are optimistic and each one is followed by a settling read, so genuine
+// changes arrive constantly — the rows have to be updated in place.
+//
+// ListModel fixes its roles from the first row appended and stores only flat
+// scalars, so every projected row carries the identical key set with identical
+// primitive types whether it is a room header or a device, and anything
+// without a scalar form gets one here: readings pre-join to a string, an
+// unknown brightness becomes -1 (the delegate reads < 0 as "no value").
+
+function renderRow(kind, name, device) {
+  return {
+    key: kind + " " + String(name),
+    kind: kind,
+    name: String(name),
+    category: device ? String(device.category) : "",
+    readingsText: device && device.readings.length > 0 ? device.readings.join(" · ") : "",
+    controllable: device ? device.controllable === true : false,
+    reachable: device ? device.reachable === true : true,
+    unknown: device ? device.unknown === true : false,
+    hasBrightness: device ? device.hasBrightness === true : false,
+    power: device ? device.power === true : false,
+    brightness: device && device.brightness !== null && device.brightness !== undefined
+      ? Number(device.brightness) : -1
+  }
+}
+
+// [{room, devices[]}] flattened to one row list in display order: a header row
+// per room followed by its devices. One flat model keeps the sync trivial and
+// means a device moving between rooms is an ordinary insert/remove.
+function projectRooms(rooms) {
+  var out = []
+  var list = rooms || []
+  for (var r = 0; r < list.length; r++) {
+    var room = list[r]
+    out.push(renderRow("roomHeader", room.room, null))
+    var devices = room.devices || []
+    for (var d = 0; d < devices.length; d++) out.push(renderRow("device", devices[d].name, devices[d]))
+  }
+  return out
+}
+
+function projectScenes(scenes) {
+  var out = []
+  var list = scenes || []
+  for (var i = 0; i < list.length; i++) {
+    var scene = list[i]
+    out.push({
+      key: String(scene.name),
+      name: String(scene.name),
+      subtitle: sceneSubtitle(scene),
+      // HomeKit's stock empty scenes stay on screen for context but cannot be
+      // run, so the delegate needs this as a flat flag.
+      runnable: Number(scene.actionCount || 0) > 0
+    })
+  }
+  return out
+}
+
+// Whether syncModel would insert or remove anything, asked before it runs so
+// the panel can save its scroll position ahead of the one kind of change that
+// disturbs it. Membership changes only when HomeKit gains or loses an
+// accessory, so in the steady state this walk finds every key in place and the
+// sync that follows is property updates only.
+function structureDiffers(model, rows) {
+  if (model.count !== rows.length) return true
+  for (var i = 0; i < rows.length; i++) if (model.get(i).key !== rows[i].key) return true
+  return false
+}
+
+// Walks the projected rows against the model in order, updating roles in place
+// where the keys line up and patching membership where they diverge. Per-role
+// setProperty rather than set(): set() rewrites every role, waking bindings on
+// values that did not change (and does not reliably coerce a bool back).
+function syncModel(model, rows) {
+  var updated = 0
+  var inserted = 0
+  var removed = 0
+  var i = 0
+
+  while (i < rows.length) {
+    var row = rows[i]
+    if (i >= model.count) {
+      model.append(row)
+      inserted += 1
+      i += 1
+      continue
+    }
+
+    var existing = model.get(i)
+    if (existing.key === row.key) {
+      for (var role in row) {
+        if (existing[role] !== row[role]) {
+          model.setProperty(i, role, row[role])
+          updated += 1
+        }
+      }
+      i += 1
+      continue
+    }
+
+    // Keys diverge. If this row's key turns up further down the model then
+    // everything before it is gone; otherwise this row is new here.
+    var found = -1
+    for (var j = i + 1; j < model.count; j++) {
+      if (model.get(j).key === row.key) { found = j; break }
+    }
+    if (found >= 0) {
+      model.remove(i, found - i)
+      removed += found - i
+    } else {
+      model.insert(i, row)
+      inserted += 1
+      i += 1
+    }
+  }
+
+  if (model.count > rows.length) {
+    removed += model.count - rows.length
+    model.remove(rows.length, model.count - rows.length)
+  }
+
+  return { updated: updated, inserted: inserted, removed: removed }
+}
+
 // ------------------------------------------------------------- failures
 
 function firstLine(text) {

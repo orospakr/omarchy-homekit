@@ -4,7 +4,6 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
-import "Model.js" as Model
 
 // HomeKit control popup: scenes on top, then every controllable accessory
 // grouped by room, driven by homeclaw-cli running on a Mac over SSH.
@@ -229,12 +228,12 @@ Panel {
     svc.setBrightness(device.name, current + direction * 10)
   }
 
-  // A model rebuild recreates every Repeater delegate, which collapses the
-  // column for a frame and the Flickable clamps contentY to 0. The service
-  // signals just before it reassigns rooms/scenes, so the position is captured
-  // while it is still real and put back once the new delegates have laid out
-  // (callLater for the common case, plus one timer tick for late positioner
-  // passes).
+  // Inserting or removing rows relays out the column, and for the frame it is
+  // short the Flickable clamps contentY toward 0. Ordinary refreshes only
+  // update roles in place and never come through here; the service signals
+  // just before a structural change, so the position is captured while it is
+  // still real and put back once the new delegates have laid out (callLater
+  // for the common case, plus one timer tick for late positioner passes).
   property real savedScrollY: 0
 
   Connections {
@@ -411,158 +410,178 @@ Panel {
           }
 
           Repeater {
-            model: svc.scenes
+            model: svc.scenesModel
 
             Button {
               id: sceneRow
-              required property var modelData
+              required property string name
+              required property string subtitle
+              required property bool runnable
 
-              readonly property bool busy: svc.isSceneBusy(modelData.name)
-              readonly property bool runnable: modelData.actionCount > 0
+              readonly property bool busy: svc.isSceneBusy(sceneRow.name)
 
               width: column.width
               leftAlign: true
-              text: modelData.name
+              text: sceneRow.name
               iconText: busy ? "󰑐" : "󰐊"  // nf-md-refresh / nf-md-play
               iconSpinning: busy
-              tooltipText: Model.sceneSubtitle(modelData)
+              tooltipText: sceneRow.subtitle
               foreground: root.foreground
               accent: root.foreground
               fontFamily: root.fontFamily
-              hasCursor: root.rowHasCursor("scene", modelData.name)
+              hasCursor: root.rowHasCursor("scene", sceneRow.name)
               // An empty scene is shown for context but cannot be run.
-              enabled: runnable && !busy
-              opacity: runnable ? 1.0 : 0.4
+              enabled: sceneRow.runnable && !busy
+              opacity: sceneRow.runnable ? 1.0 : 0.4
 
               onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(sceneRow)
-              onHovered: function(on) { if (on) root.focusRow("scene", modelData.name) }
-              onClicked: svc.triggerScene(modelData.name)
+              onHovered: function(on) { if (on) root.focusRow("scene", sceneRow.name) }
+              onClicked: svc.triggerScene(sceneRow.name)
             }
           }
 
           // ---------- Devices, grouped by room ----------
-          Repeater {
-            model: svc.rooms
+          //
+          // One flat model of room-header and device rows (Model.projectRooms
+          // builds it) rendered by a single Repeater, so a refresh diffs into
+          // the existing delegates instead of tearing down a nest of them.
+          // Rows inside a room sit closer together than the sections above, so
+          // a header row pads itself back out to the section gap.
+          Column {
+            id: deviceColumn
+            width: parent.width
+            visible: svc.rowsModel.count > 0
+            spacing: Style.space(4)
 
-            Column {
-              id: roomGroup
-              required property var modelData
+            Repeater {
+              model: svc.rowsModel
 
-              width: column.width
-              spacing: Style.space(4)
+              Column {
+                id: row
+                required property int index
+                required property string kind
+                required property string name
+                required property string category
+                required property string readingsText
+                required property bool controllable
+                required property bool reachable
+                required property bool unknown
+                required property bool hasBrightness
+                required property bool power
+                required property int brightness
 
-              PanelSeparator {
-                width: parent.width
-                foreground: root.foreground
-              }
+                readonly property bool isDevice: row.kind === "device"
+                readonly property bool busy: row.isDevice && svc.isDeviceBusy(row.name)
 
-              PanelSectionHeader {
-                text: roomGroup.modelData.room
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
+                width: deviceColumn.width
+                spacing: row.isDevice ? 0 : Style.space(4)
 
-              Repeater {
-                model: roomGroup.modelData.devices
+                Item {
+                  visible: !row.isDevice && row.index > 0
+                  width: 1
+                  height: Style.space(2)
+                }
 
-                Column {
-                  id: deviceGroup
-                  required property var modelData
+                PanelSeparator {
+                  visible: !row.isDevice
+                  width: parent.width
+                  foreground: root.foreground
+                }
 
-                  readonly property bool busy: svc.isDeviceBusy(modelData.name)
-                  readonly property bool live: modelData.reachable && !busy
+                PanelSectionHeader {
+                  visible: !row.isDevice
+                  text: row.name
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                }
 
-                  width: roomGroup.width
-                  spacing: 0
+                // Controllable accessory: an optimistic labeled toggle. The
+                // service flips the value the moment it is clicked, so the
+                // switch answers immediately and only snaps back if the
+                // write actually fails.
+                Toggle {
+                  id: deviceToggle
+                  visible: row.isDevice && row.controllable
+                  width: parent.width
+                  label: row.name
+                  description: {
+                    if (row.busy) return "Switching…"
+                    if (!row.reachable) return "Unreachable"
+                    if (row.unknown) return "State unknown"
+                    if (row.hasBrightness && row.brightness >= 0 && row.power)
+                      return row.brightness + "%"
+                    return row.category
+                  }
+                  checked: row.power
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  hasCursor: root.rowHasCursor("device", row.name)
+                  enabled: row.reachable
+                  opacity: row.reachable ? (row.busy ? 0.7 : 1.0) : 0.45
 
-                  // Controllable accessory: an optimistic labeled toggle. The
-                  // service flips the value the moment it is clicked, so the
-                  // switch answers immediately and only snaps back if the
-                  // write actually fails.
-                  Toggle {
-                    id: deviceToggle
-                    visible: deviceGroup.modelData.controllable
-                    width: parent.width
-                    label: deviceGroup.modelData.name
-                    description: {
-                      if (deviceGroup.busy) return "Switching…"
-                      if (!deviceGroup.modelData.reachable) return "Unreachable"
-                      if (deviceGroup.modelData.unknown) return "State unknown"
-                      if (deviceGroup.modelData.hasBrightness && deviceGroup.modelData.brightness !== null
-                          && deviceGroup.modelData.power === true)
-                        return deviceGroup.modelData.brightness + "%"
-                      return deviceGroup.modelData.category
-                    }
-                    checked: deviceGroup.modelData.power === true
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    hasCursor: root.rowHasCursor("device", deviceGroup.modelData.name)
-                    enabled: deviceGroup.modelData.reachable
-                    opacity: deviceGroup.modelData.reachable ? (deviceGroup.busy ? 0.7 : 1.0) : 0.45
+                  onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(deviceToggle)
+                  onHovered: function(on) { if (on) root.focusRow("device", row.name) }
+                  onClicked: {
+                    if (row.busy) return
+                    svc.setPower(row.name, !row.power)
+                  }
+                }
 
-                    onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(deviceToggle)
-                    onHovered: function(on) { if (on) root.focusRow("device", deviceGroup.modelData.name) }
-                    onClicked: {
-                      if (deviceGroup.busy) return
-                      svc.setPower(deviceGroup.modelData.name, deviceGroup.modelData.power !== true)
-                    }
+                // Dimmer for lights that report brightness. The write fires
+                // on release only — a drag emits `moved` every frame, and
+                // each one would be a full SSH round trip. Dimmer.qml rather
+                // than qs.Ui.PanelSlider because upstream turns every wheel
+                // tick into a `released`, i.e. an SSH write per notch of a
+                // scroll gesture that was only meant to scroll the list.
+                Dimmer {
+                  visible: row.isDevice && row.controllable && row.hasBrightness
+                  width: parent.width - Style.space(24)
+                  x: Style.space(12)
+                  bar: root.bar
+                  minimum: 0
+                  maximum: 100
+                  step: 5
+                  integer: true
+                  // -1 is "has the characteristic, has never reported a
+                  // value"; the track sits at zero rather than guessing.
+                  value: row.brightness < 0 ? 0 : row.brightness
+                  enabled: row.reachable && !row.busy
+                  opacity: row.reachable ? (row.busy ? 0.7 : 1.0) : 0.45
+
+                  onReleased: function(value) { svc.setBrightness(row.name, value) }
+                }
+
+                // Read-only accessory (sensors, and anything whose category
+                // has no power characteristic worth flipping).
+                Item {
+                  visible: row.isDevice && !row.controllable
+                  width: parent.width
+                  implicitHeight: Style.spacing.popupRowHeight
+                  opacity: row.reachable ? 1.0 : 0.45
+
+                  Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.spacing.rowPaddingX
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width * 0.5
+                    text: row.name
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
                   }
 
-                  // Dimmer for lights that report brightness. The write fires
-                  // on release only — a drag emits `moved` every frame, and
-                  // each one would be a full SSH round trip. Dimmer.qml rather
-                  // than qs.Ui.PanelSlider because upstream turns every wheel
-                  // tick into a `released`, i.e. an SSH write per notch of a
-                  // scroll gesture that was only meant to scroll the list.
-                  Dimmer {
-                    id: dimmer
-                    visible: deviceGroup.modelData.controllable && deviceGroup.modelData.hasBrightness
-                    width: parent.width - Style.space(24)
-                    x: Style.space(12)
-                    bar: root.bar
-                    minimum: 0
-                    maximum: 100
-                    step: 5
-                    integer: true
-                    value: deviceGroup.modelData.brightness === null ? 0 : deviceGroup.modelData.brightness
-                    enabled: deviceGroup.modelData.reachable && !deviceGroup.busy
-                    opacity: deviceGroup.modelData.reachable ? (deviceGroup.busy ? 0.7 : 1.0) : 0.45
-
-                    onReleased: function(value) { svc.setBrightness(deviceGroup.modelData.name, value) }
-                  }
-
-                  // Read-only accessory (sensors, and anything whose category
-                  // has no power characteristic worth flipping).
-                  Item {
-                    visible: !deviceGroup.modelData.controllable
-                    width: parent.width
-                    implicitHeight: Style.spacing.popupRowHeight
-                    opacity: deviceGroup.modelData.reachable ? 1.0 : 0.45
-
-                    Text {
-                      anchors.left: parent.left
-                      anchors.leftMargin: Style.spacing.rowPaddingX
-                      anchors.verticalCenter: parent.verticalCenter
-                      width: parent.width * 0.5
-                      text: deviceGroup.modelData.name
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
-                      elide: Text.ElideRight
-                    }
-
-                    Text {
-                      anchors.right: parent.right
-                      anchors.rightMargin: Style.spacing.rowPaddingX
-                      anchors.verticalCenter: parent.verticalCenter
-                      text: deviceGroup.modelData.readings.length > 0
-                        ? deviceGroup.modelData.readings.join(" · ")
-                        : (deviceGroup.modelData.reachable ? deviceGroup.modelData.category : "Unreachable")
-                      color: root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      elide: Text.ElideRight
-                    }
+                  Text {
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.spacing.rowPaddingX
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: row.readingsText !== ""
+                      ? row.readingsText
+                      : (row.reachable ? row.category : "Unreachable")
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
                   }
                 }
               }

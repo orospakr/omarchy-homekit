@@ -45,13 +45,19 @@ Item {
   // Transient one-line feedback for a write or a scene trigger.
   property string actionStatus: ""
 
-  // Reassigning rooms/scenes recreates every Repeater delegate in the panel,
-  // which collapses the content column and snaps the scroll position to the
-  // top — so identical rebuilds are dropped, and the panel gets a beat of
-  // warning before a real one lands so it can preserve the scroll position.
+  // `rooms`/`scenes` above stay the source of truth for logic — counts, the
+  // panel's keyboard cursor, name lookups. What the panel *renders* is these
+  // two ListModels, kept in step by a diff so a refresh touches only the rows
+  // that actually changed; see the render projections in Model.js for why.
+  ListModel { id: sceneRows }
+  ListModel { id: deviceRows }
+  readonly property alias scenesModel: sceneRows
+  readonly property alias rowsModel: deviceRows
+
+  // Property-only updates leave the delegates — and therefore the scroll
+  // position — alone. Inserting or removing rows still relays out the column,
+  // so the panel gets a beat of warning before those and only those.
   signal modelAboutToChange()
-  property string _roomsSerialized: ""
-  property string _scenesSerialized: ""
 
   readonly property int deviceCount: Model.countDevices(rooms)
   readonly property int poweredOnCount: Model.countPoweredOn(rooms)
@@ -197,12 +203,19 @@ Item {
   }
 
   function rebuild() {
-    var next = Model.buildRooms(root.rawAccessories, root.hiddenRooms, root.overrides)
-    var serialized = JSON.stringify(next)
-    if (serialized === root._roomsSerialized) return
-    root.modelAboutToChange()
-    root._roomsSerialized = serialized
-    root.rooms = next
+    root.rooms = Model.buildRooms(root.rawAccessories, root.hiddenRooms, root.overrides)
+    syncInto(deviceRows, Model.projectRooms(root.rooms))
+  }
+
+  function syncScenes() {
+    syncInto(sceneRows, Model.projectScenes(root.scenes))
+  }
+
+  function syncInto(model, rows) {
+    // Asked before the sync rather than reported by it: the panel has to
+    // capture contentY while the old delegates are still standing.
+    if (Model.structureDiffers(model, rows)) root.modelAboutToChange()
+    Model.syncModel(model, rows)
   }
 
   onHiddenRoomsChanged: rebuild()
@@ -246,12 +259,8 @@ Item {
         if (parsed.ok && parsed.value && parsed.value.length !== undefined) {
           var built = Model.buildScenes(parsed.value)
           if (built.homeName !== "") root.homeName = built.homeName
-          var serializedScenes = JSON.stringify(built.scenes)
-          if (serializedScenes !== root._scenesSerialized) {
-            root.modelAboutToChange()
-            root._scenesSerialized = serializedScenes
-            root.scenes = built.scenes
-          }
+          root.scenes = built.scenes
+          root.syncScenes()
         } else if (!failure) {
           failure = { kind: "cli", message: parsed.message || "Unexpected output from scenes", remedy: "" }
         }
