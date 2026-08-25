@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "andrew.homekit",
+  "name": "HomeKit",
+  "version": "1.0.0",
+  "author": "andrew",
+  "description": "Control Apple HomeKit lights, outlets, and scenes through the HomeClaw CLI running on a Mac over SSH",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "HomeKit",
+    "description": "Toggle HomeKit accessories, dim lights, and run scenes from the bar.",
+    "category": "Home",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "host": "snively",
+      "cliPath": "/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli",
+      "icon": "󰋜",
+      "pollSeconds": 10,
+      "hiddenRooms": []
+    },
+    "schema": [
+      {
+        "key": "host",
+        "type": "string",
+        "label": "SSH host running HomeClaw",
+        "defaultValue": "snively"
+      },
+      {
+        "key": "cliPath",
+        "type": "string",
+        "label": "Absolute path to homeclaw-cli on that host",
+        "defaultValue": "/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli"
+      },
+      {
+        "key": "icon",
+        "type": "string",
+        "label": "Bar icon glyph",
+        "defaultValue": "󰋜"
+      },
+      {
+        "key": "pollSeconds",
+        "type": "integer",
+        "label": "Refresh interval while the panel is open (seconds)",
+        "min": 3,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "hiddenRooms",
+        "type": "array",
+        "label": "Rooms to hide from the panel"
+      }
+    ]
+  }
+}
