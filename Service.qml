@@ -45,6 +45,14 @@ Item {
   // Transient one-line feedback for a write or a scene trigger.
   property string actionStatus: ""
 
+  // Reassigning rooms/scenes recreates every Repeater delegate in the panel,
+  // which collapses the content column and snaps the scroll position to the
+  // top — so identical rebuilds are dropped, and the panel gets a beat of
+  // warning before a real one lands so it can preserve the scroll position.
+  signal modelAboutToChange()
+  property string _roomsSerialized: ""
+  property string _scenesSerialized: ""
+
   readonly property int deviceCount: Model.countDevices(rooms)
   readonly property int poweredOnCount: Model.countPoweredOn(rooms)
 
@@ -189,7 +197,12 @@ Item {
   }
 
   function rebuild() {
-    root.rooms = Model.buildRooms(root.rawAccessories, root.hiddenRooms, root.overrides)
+    var next = Model.buildRooms(root.rawAccessories, root.hiddenRooms, root.overrides)
+    var serialized = JSON.stringify(next)
+    if (serialized === root._roomsSerialized) return
+    root.modelAboutToChange()
+    root._roomsSerialized = serialized
+    root.rooms = next
   }
 
   onHiddenRoomsChanged: rebuild()
@@ -232,8 +245,13 @@ Item {
         var parsed = Model.parseJson(out)
         if (parsed.ok && parsed.value && parsed.value.length !== undefined) {
           var built = Model.buildScenes(parsed.value)
-          root.scenes = built.scenes
           if (built.homeName !== "") root.homeName = built.homeName
+          var serializedScenes = JSON.stringify(built.scenes)
+          if (serializedScenes !== root._scenesSerialized) {
+            root.modelAboutToChange()
+            root._scenesSerialized = serializedScenes
+            root.scenes = built.scenes
+          }
         } else if (!failure) {
           failure = { kind: "cli", message: parsed.message || "Unexpected output from scenes", remedy: "" }
         }

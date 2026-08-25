@@ -229,6 +229,38 @@ Panel {
     svc.setBrightness(device.name, current + direction * 10)
   }
 
+  // A model rebuild recreates every Repeater delegate, which collapses the
+  // column for a frame and the Flickable clamps contentY to 0. The service
+  // signals just before it reassigns rooms/scenes, so the position is captured
+  // while it is still real and put back once the new delegates have laid out
+  // (callLater for the common case, plus one timer tick for late positioner
+  // passes).
+  property real savedScrollY: 0
+
+  Connections {
+    target: svc
+    function onModelAboutToChange() {
+      var flick = scrollArea.contentItem
+      if (!flick || flick.contentY === undefined) return
+      root.savedScrollY = flick.contentY
+      Qt.callLater(root.restoreScroll)
+      scrollRestoreTimer.restart()
+    }
+  }
+
+  Timer {
+    id: scrollRestoreTimer
+    interval: 50
+    onTriggered: root.restoreScroll()
+  }
+
+  function restoreScroll() {
+    var flick = scrollArea.contentItem
+    if (!flick || flick.contentY === undefined) return
+    var maxY = Math.max(0, (flick.contentHeight || 0) - flick.height)
+    flick.contentY = Math.max(0, Math.min(maxY, root.savedScrollY))
+  }
+
   // Copied from the audio panel: keep the keyboard cursor inside the viewport
   // without disturbing the scroll position when everything already fits.
   function ensureCursorVisible(item) {
