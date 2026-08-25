@@ -510,8 +510,11 @@ Panel {
 
                   // Dimmer for lights that report brightness. The write fires
                   // on release only — a drag emits `moved` every frame, and
-                  // each one would be a full SSH round trip.
-                  PanelSlider {
+                  // each one would be a full SSH round trip. Dimmer.qml rather
+                  // than qs.Ui.PanelSlider because upstream turns every wheel
+                  // tick into a `released`, i.e. an SSH write per notch of a
+                  // scroll gesture that was only meant to scroll the list.
+                  Dimmer {
                     id: dimmer
                     visible: deviceGroup.modelData.controllable && deviceGroup.modelData.hasBrightness
                     width: parent.width - Style.space(24)
