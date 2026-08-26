@@ -22,6 +22,7 @@
       "cliPath": "/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli",
       "icon": "󰋜",
       "pollSeconds": 10,
+      "scrollSpeed": 4.0,
       "hiddenRooms": []
     },
     "schema": [
@@ -51,6 +52,12 @@
         "max": 120,
         "step": 1,
         "defaultValue": 10
+      },
+      {
+        "key": "scrollSpeed",
+        "type": "number",
+        "label": "Trackpad scroll speed factor",
+        "defaultValue": 4.0
       },
       {
         "key": "hiddenRooms",

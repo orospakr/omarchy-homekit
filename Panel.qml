@@ -234,6 +234,52 @@ Panel {
   // just before a structural change, so the position is captured while it is
   // still real and put back once the new delegates have laid out (callLater
   // for the common case, plus one timer tick for late positioner passes).
+  // ---- trackpad kinetic scrolling (ported from andrew.daily-bible).
+  //
+  // On Linux/Wayland there are no OS-synthesized momentum wheel events, so
+  // Flickable's stock wheel handling is direct-drive and sluggish: content
+  // stops dead the moment fingers leave the pad. Wheel events are intercepted
+  // by an overlay MouseArea, scaled, and their velocity measured over a
+  // trailing window; when the stream goes quiet the tail velocity is handed to
+  // Flickable's own flick() physics, which already knows how to decelerate.
+  // Default compensates the Hyprland touchpad scroll_factor (0.4 here):
+  // 4.0 × 0.4 ≈ 1.6× effective, comparable to a browser's feel.
+  readonly property real wheelSpeed: Number(setting("scrollSpeed", 4.0)) || 4.0
+  property var wheelSamples: []
+
+  function wheelScroll(dy) {
+    var flick = scrollArea.contentItem
+    if (!flick || flick.contentY === undefined) return
+    flick.cancelFlick()
+    var maxY = Math.max(0, (flick.contentHeight || 0) - flick.height)
+    flick.contentY = Math.max(0, Math.min(maxY, flick.contentY - dy))
+    var now = Date.now()
+    var samples = wheelSamples
+    samples.push({ t: now, dy: dy })
+    while (samples.length > 0 && now - samples[0].t > 120) samples.shift()
+    flickHandoff.restart()
+  }
+
+  Timer {
+    id: flickHandoff
+    interval: 70  // longer than any inter-event gap while fingers move
+    onTriggered: {
+      var samples = root.wheelSamples
+      root.wheelSamples = []
+      if (samples.length < 2) return
+      var flick = scrollArea.contentItem
+      if (!flick || flick.contentY === undefined) return
+      var span = (samples[samples.length - 1].t - samples[0].t) / 1000
+      if (span <= 0) return
+      var sum = 0
+      for (var i = 0; i < samples.length; i++) sum += samples[i].dy
+      var velocity = sum / span  // px/s; positive = upward swipe direction
+      velocity = Math.max(-flick.maximumFlickVelocity, Math.min(flick.maximumFlickVelocity, velocity))
+      // Ignore the tail of a slow, deliberate scroll — only real swipes glide.
+      if (Math.abs(velocity) > 300) flick.flick(0, velocity)
+    }
+  }
+
   property real savedScrollY: 0
 
   Connections {
@@ -321,6 +367,10 @@ Panel {
           property: "interactive"
           value: column.implicitHeight > scrollArea.height
         }
+        Binding { target: scrollArea.contentItem; property: "boundsBehavior"; value: Flickable.StopAtBounds }
+        Binding { target: scrollArea.contentItem; property: "flickableDirection"; value: Flickable.VerticalFlick }
+        Binding { target: scrollArea.contentItem; property: "maximumFlickVelocity"; value: 4000 }
+        Binding { target: scrollArea.contentItem; property: "flickDeceleration"; value: 1200 }
 
         Column {
           id: column
@@ -619,6 +669,27 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
+        }
+      }
+
+      // Wheel interceptor: topmost overlay MouseArea (the same idiom the
+      // shell's bar widgets use for trackpad scroll). NoButton keeps clicks
+      // and drags falling through to the rows beneath; wheel events —
+      // including the phased per-frame pixelDelta stream a trackpad produces —
+      // are consumed here so the ScrollView's laggy drag-emulation path never
+      // engages, and so no slider or toggle ever sees them. Discrete mouse
+      // wheels deliver only angleDelta, scaled so one notch is a comfortable
+      // step.
+      MouseArea {
+        anchors.fill: scrollArea
+        z: 10
+        acceptedButtons: Qt.NoButton
+        onWheel: function(w) {
+          var dy = w.pixelDelta.y !== 0
+            ? w.pixelDelta.y * root.wheelSpeed
+            : (w.angleDelta.y / 120) * Style.space(90)
+          root.wheelScroll(dy)
+          w.accepted = true
         }
       }
     }
