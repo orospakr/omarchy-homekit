@@ -459,34 +459,43 @@ Panel {
             fontFamily: root.fontFamily
           }
 
-          Repeater {
-            model: svc.scenesModel
+          // Scenes are short names, so they pack as a wrapping flow of pill
+          // buttons rather than one full-width row each: quicker to scan and
+          // a fraction of the height. Keyboard order is still left-to-right,
+          // top-to-bottom, matching the model order.
+          Flow {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: svc.scenes.length > 0
 
-            Button {
-              id: sceneRow
-              required property string name
-              required property string subtitle
-              required property bool runnable
+            Repeater {
+              model: svc.scenesModel
 
-              readonly property bool busy: svc.isSceneBusy(sceneRow.name)
+              Button {
+                id: sceneRow
+                required property string name
+                required property string subtitle
+                required property bool runnable
 
-              width: column.width
-              leftAlign: true
-              text: sceneRow.name
-              iconText: busy ? "󰑐" : "󰐊"  // nf-md-refresh / nf-md-play
-              iconSpinning: busy
-              tooltipText: sceneRow.subtitle
-              foreground: root.foreground
-              accent: root.foreground
-              fontFamily: root.fontFamily
-              hasCursor: root.rowHasCursor("scene", sceneRow.name)
-              // An empty scene is shown for context but cannot be run.
-              enabled: sceneRow.runnable && !busy
-              opacity: sceneRow.runnable ? 1.0 : 0.4
+                readonly property bool busy: svc.isSceneBusy(sceneRow.name)
 
-              onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(sceneRow)
-              onHovered: function(on) { if (on) root.focusRow("scene", sceneRow.name) }
-              onClicked: svc.triggerScene(sceneRow.name)
+                bordered: true
+                text: sceneRow.name
+                iconText: busy ? "󰑐" : "󰐊"  // nf-md-refresh / nf-md-play
+                iconSpinning: busy
+                tooltipText: sceneRow.subtitle
+                foreground: root.foreground
+                accent: root.foreground
+                fontFamily: root.fontFamily
+                hasCursor: root.rowHasCursor("scene", sceneRow.name)
+                // An empty scene is shown for context but cannot be run.
+                enabled: sceneRow.runnable && !busy
+                opacity: sceneRow.runnable ? 1.0 : 0.4
+
+                onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(sceneRow)
+                onHovered: function(on) { if (on) root.focusRow("scene", sceneRow.name) }
+                onClicked: svc.triggerScene(sceneRow.name)
+              }
             }
           }
 
