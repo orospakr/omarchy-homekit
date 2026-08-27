@@ -39,8 +39,11 @@ the doctor will name the link.
 ~/.config/omarchy/plugins/andrew.homekit/bin/homekit-doctor my-mac    # or check a host directly
 ```
 
-It only ever runs read-only HomeClaw subcommands (`status`, `list`, `scenes`),
-so it is safe to run at any time; it changes nothing in the home.
+It only ever runs read-only HomeClaw subcommands — `status`, `list` and
+`scenes`, which are exactly the three reads the panel itself makes — so it is
+safe to run at any time; it changes nothing in the home. It passes only when
+all three actually came back as JSON, so "All checks passed" means the widget's
+own calls succeeded, not merely that ssh works.
 
 ## What it does
 
@@ -192,13 +195,32 @@ A healthy run ends like this:
 ✔ ssh-agent has 1 key(s) loaded
 ✔ SSH to mac-mini works
 ✔ homeclaw-cli is executable at /Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli
-✔ HomeClaw is ready on mac-mini — "My Home"
-  14 accessories in 1 home(s), 8 scenes (list returns 14 entries)
+✔ HomeClaw is ready on mac-mini
+  14 accessories in 1 home(s)
+✔ Both panel reads work on mac-mini — "My Home"
+  list --json → 14 accessories · scenes --json → 8 scenes
 ```
 
-Anything else stops at the broken link with the fix for it. The doctor uses the
-same ssh options the widget does, so a passing run also leaves a warm
-multiplexed connection behind for the panel's first open.
+Anything else stops at the broken link with the fix for it. The last step is
+the one that matters most once the transport is healthy: it runs `scenes --json`
+and `list --json` — the two reads the panel is built on — and fails unless each
+exits zero and answers with a JSON array. A `status` that works while `list`
+fails is exactly how the panel breaks, so the doctor is not allowed to pass on
+`status` alone.
+
+That check needs a real JSON parser on *this* machine — `jq`, or `python3` as
+the fallback. With neither installed the doctor stops at that step and says so
+rather than eyeballing the reply with a regex: "starts with a `[`" is not the
+same as "is a JSON array", and a run that cannot verify the replies is not
+allowed to print "All checks passed".
+
+The doctor uses the same ssh options the widget does, so a passing run also
+leaves a warm multiplexed connection behind for the panel's first open. It
+treats everything coming back from the Mac as hostile input: counts are
+type-checked before they are compared, a reply of the wrong shape fails the
+step it came from, a setting carrying control characters is refused rather than
+silently trimmed to something the widget would never accept, and remote text is
+stripped of terminal escape sequences before it is printed.
 
 ## Troubleshooting
 
@@ -220,14 +242,46 @@ picks which one. Every kind below maps to a doctor step.
 ## IPC
 
 Beyond the usual `open`/`close`/`toggle`/`refresh`, the panel exposes write
-routes so a Hyprland bind can act without opening anything. Names are exactly
-what `list`/`scenes` report, spaces and all.
+routes so a Hyprland bind can act without opening anything.
 
 ```
 omarchy-shell andrew.homekit scene "Good Night"
-omarchy-shell andrew.homekit power "Desk Lamp" false
+omarchy-shell andrew.homekit power "Desk Lamp" off
+omarchy-shell andrew.homekit power "Desk Lamp" toggle
+omarchy-shell andrew.homekit power 8B1D0F42-0C1A-4E7E-9B0E-6E8B7A2C51D3 on
 omarchy-shell andrew.homekit brightness "Desk Lamp" 40
 ```
+
+**Naming.** The first argument is either a HomeKit UUID — the `id` field of
+`list --json` / `scenes --json` — or the display name those report, spaces and
+all. A UUID is matched first, then an exact name, then a case-insensitive one.
+**A name that two things answer to is refused** rather than guessed at: two
+rooms may each hold a "Lamp", and `homeclaw-cli` resolves a duplicate name by
+taking the first match, which is how the wrong lamp in the wrong room gets
+switched. Use the UUID for those. A name nothing in the last read answers to is
+refused here too, instead of being handed to the CLI to resolve.
+
+Names are resolved against what was last read from the Mac, and reads only run
+while the panel is open — so the first name-based call after the shell starts
+has nothing to match against. It kicks off a refresh and says so; the next call
+lands. A bare UUID needs no model and goes straight through.
+
+**Values are validated, never coerced.** `power` accepts `true`, `false`, `on`,
+`off`, `1`, `0` and `toggle`, in any case; anything else is refused, because a
+typo like `tru` reading as false is a light switched off rather than an error.
+`toggle` needs the current state, so it works only for an accessory the panel
+has already read. `brightness` accepts a finite number from 0 to 100, with an
+optional trailing `%`; an empty argument or `1e999` is refused rather than
+becoming 0 or 100.
+
+**Trust boundary.** The write routes are always registered — there is no opt-in
+flag and no per-accessory allowlist. Any process running as the same login user
+can call them through QuickShell's IPC socket, so anything that can reach your
+shell can trigger a scene or flip an outlet without a window ever appearing.
+That is the same boundary as the ssh key those calls end up using: a process
+that can talk to your QuickShell can equally run `ssh <your-mac> homeclaw-cli
+set …` itself, so exposing them widens nothing. It does mean the panel is not a
+lock on anything — the lock is the login session and the key in it.
 
 ## Settings
 
@@ -264,6 +318,14 @@ is ever passed through a shell on this side — `Process.command` is always an
 argv array. `bin/homekit-doctor` repeats the same trick in bash, for the same
 reason.
 
+The destination itself is the one thing that cannot be quoted out of trouble:
+`ssh` reads a leading `-` as one of its own options even when the host arrives
+as a separate argv element, and `-oProxyCommand=…` runs a command on *this*
+machine. So both command builders put `--` before the host, and both refuse a
+`host` that starts with a dash or carries whitespace or control characters —
+no real destination looks like that, and a settings file is not a trusted
+input.
+
 **Connection multiplexing.** A cold handshake to the Mac costs about a second,
 and a refresh is two calls with a third following every write. `ControlMaster`
 with a 5-minute `ControlPersist` collapses them onto one connection, so only
@@ -279,8 +341,18 @@ so reopening renders instantly while a fresh read lands underneath.
 
 **Optimistic writes.** HomeClaw confirms a `set` before HomeKit has propagated
 it through the bridge, so the requested value is overlaid on the model at click
-time, held through the round trip plus a short settling window, and dropped on
-failure so the row snaps back to the truth next to the error.
+time and held for the whole round trip. A confirmed write extends that override
+to a 2.5-second settling window and schedules one follow-up read 900 ms later —
+long enough for the bridge to catch up, short enough to still feel immediate.
+That read normally lands while the override is still standing, so a timer fires
+just past the end of the window, prunes whatever has expired (anything with a
+write still in flight is kept) and rebuilds from the last state the Mac actually
+reported. Without it, a write the bridge acknowledged but never applied would
+keep showing the requested value until the next poll — or forever, behind a
+closed panel. A failed write drops its override immediately, so the row snaps
+back to the truth next to the error. Refreshes coalesce rather than queue: one
+asked for while another is in flight sets a pending flag and runs once that one
+settles, so the settle read is never simply dropped on the floor.
 
 **Failure triage.** Three failures look identical from the shell (non-zero
 exit, some stderr) but need three different remedies, so `Model.classifyFailure`

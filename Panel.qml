@@ -4,6 +4,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "Model.js" as Model
 
 // HomeKit control popup: scenes on top, then every controllable accessory
 // grouped by room, driven by homeclaw-cli running on a Mac over SSH.
@@ -104,8 +105,22 @@ Panel {
     hiddenRooms: root.hiddenRoomsSetting
   }
 
-  // Pointing the widget at a different Mac invalidates everything on screen.
-  onHostSettingChanged: if (root.opened) root.refresh()
+  // Pointing the widget at a different Mac (or at a different homeclaw-cli)
+  // invalidates everything on screen. The service drops it all and signals when
+  // it is done; listening for that rather than for the setting keeps the read
+  // strictly after the clear, whatever order the bindings happen to update in.
+  //
+  // Specifically not endpointGeneration: that changes at the *start* of the
+  // invalidation (so in-flight callbacks are discarded from that moment), and a
+  // refresh answering it ran while the old read's `loading` was still set, so
+  // it only set refreshPending — which the rest of the invalidation then
+  // cleared. Nothing read the new Mac until the next poll tick.
+  Connections {
+    target: svc
+    function onEndpointInvalidated() {
+      if (root.opened) root.refresh()
+    }
+  }
 
   Timer {
     running: root.opened
@@ -125,25 +140,108 @@ Panel {
     function refresh(): void { root.refresh() }
 
     // Write routes, so a Hyprland bind can run a scene or flip a light without
-    // opening anything. Accessory and scene names are the ones `list`/`scenes`
-    // report, spaces and all.
-    function scene(name: string): void { svc.triggerScene(name) }
-    function power(name: string, value: string): void {
-      var on = value === "true" || value === "on" || value === "1"
-      svc.setPower(name, on)
+    // opening anything:
+    //
+    //   scene       <name|uuid>
+    //   power       <name|uuid>  true|false|on|off|1|0|toggle
+    //   brightness  <name|uuid>  0-100 (a trailing % is allowed)
+    //
+    // The accessory or scene is named by its HomeKit UUID — the `id` field of
+    // `list --json` / `scenes --json` — or by the display name those report,
+    // spaces and all. A name two things answer to is refused rather than
+    // guessed at, and a name nothing in the current model answers to is
+    // refused rather than handed to the CLI to resolve: HomeClaw picks the
+    // first match, which is how the wrong "Lamp" in the wrong room ends up
+    // switched.
+    //
+    // Values are validated, never coerced: `power X tru` used to read as false
+    // and switch X off. Anything unrecognized is refused with a line in the
+    // panel and a warning in the shell log.
+    function scene(name: string): void { root.ipcScene(name) }
+    function power(name: string, value: string): void { root.ipcPower(name, value) }
+    function brightness(name: string, value: string): void { root.ipcBrightness(name, value) }
+  }
+
+  // ------------------------------------------------------------- ipc plumbing
+  function ipcReject(message) {
+    console.warn("andrew.homekit: " + message)
+    svc.flashStatus(message)
+  }
+
+  // Resolves an IPC argument to a UUID against what was last read from the
+  // Mac. Reads only run while the panel is open, so the first call after the
+  // shell starts has nothing to resolve against: it kicks one off and says so,
+  // and the next call lands. A bare UUID needs no model and goes straight
+  // through (Model.resolveIdentity accepts one it has never seen).
+  function ipcResolve(kind, token) {
+    var entries = kind === "scene" ? Model.sceneIdentities(svc.scenes)
+                                   : Model.deviceIdentities(svc.rooms)
+    var result = Model.resolveIdentity(entries, token)
+    if (result.status === "ok") return result
+    if (result.status === "ambiguous") {
+      root.ipcReject("Ambiguous name: " + token + ", use the UUID")
+      return null
     }
-    function brightness(name: string, value: string): void {
-      svc.setBrightness(name, Number(value))
+    if (!svc.everLoaded && svc.configured) {
+      svc.refresh()
+      root.ipcReject("HomeKit is still loading — try that again in a moment")
+      return null
     }
+    root.ipcReject((kind === "scene" ? "Unknown scene: " : "Unknown accessory: ") + token)
+    return null
+  }
+
+  function ipcScene(token) {
+    var target = root.ipcResolve("scene", token)
+    if (target) svc.triggerScene(target.id)
+  }
+
+  function ipcPower(token, value) {
+    var wanted = Model.parsePowerValue(value)
+    if (wanted === null) {
+      root.ipcReject("Not a power value: " + value + " — use on, off, or toggle")
+      return
+    }
+    var target = root.ipcResolve("device", token)
+    if (!target) return
+    if (wanted === "toggle") {
+      // Flipping a state means knowing it, so a UUID this side has never read
+      // cannot be toggled — only set outright.
+      var device = Model.findDevice(svc.rooms, target.id)
+      if (!device) {
+        root.ipcReject("Cannot toggle " + token + ": its current state is unknown")
+        return
+      }
+      // A found device is not automatically a device with a known state: a
+      // bulb reporting power "--" parses to null, and `power !== true` made
+      // that read as "off", so `toggle` silently meant "turn on".
+      if (device.hasPower !== true || typeof device.power !== "boolean") {
+        root.ipcReject("Power state unknown for " + token + ", use on/off")
+        return
+      }
+      wanted = !device.power
+    }
+    svc.setPower(target.id, wanted)
+  }
+
+  function ipcBrightness(token, value) {
+    var level = Model.parseBrightnessValue(value)
+    if (level === null) {
+      root.ipcReject("Not a brightness: " + value + " — use 0 to 100")
+      return
+    }
+    var target = root.ipcResolve("device", token)
+    if (target) svc.setBrightness(target.id, level)
   }
 
   // --------------------------------------------------------- status lines
   readonly property string statusLine: {
+    if (svc.failed) return Model.displayText(svc.errorMessage)
     if (!root.configured) return "Not configured"
-    if (svc.failed) return svc.errorMessage
-    if (svc.loading && !svc.everLoaded) return "Connecting to " + root.hostSetting + "…"
-    if (!svc.everLoaded) return root.hostSetting
-    return svc.deviceCount + " accessories · " + svc.scenes.length + " scenes · " + root.hostSetting
+    if (svc.loading && !svc.everLoaded) return Model.displayText("Connecting to " + root.hostSetting + "…")
+    if (!svc.everLoaded) return Model.displayText(root.hostSetting)
+    return Model.displayText(svc.deviceCount + " accessories · " + svc.scenes.length
+                             + " scenes · " + root.hostSetting)
   }
 
   readonly property string onPill: svc.everLoaded && svc.poweredOnCount > 0 ? svc.poweredOnCount + " on" : ""
@@ -151,7 +249,9 @@ Panel {
   // ------------------------------------------------------- keyboard cursor
   //
   // One flat list of everything Enter can act on, in visual order: scenes
-  // first, then each room's controllable, reachable accessories.
+  // first, then each room's controllable, reachable accessories. Rows are
+  // identified by UUID like everything else — two rooms may each hold a "Lamp"
+  // and the cursor has to be able to sit on exactly one of them.
   readonly property var flatRows: {
     var out = []
     for (var s = 0; s < svc.scenes.length; s++) {
@@ -159,14 +259,17 @@ Panel {
       // someone fills them in, and homeclaw-cli refuses to trigger those
       // ("No actions in action set", exit 64). They stay on screen as context
       // but are not something Enter should land on.
-      if (svc.scenes[s].actionCount > 0) out.push({ kind: "scene", name: svc.scenes[s].name })
+      // `actionable` is false for a scene that arrived without a UUID: it is
+      // shown for context but there is nothing safe to trigger.
+      if (svc.scenes[s].actionable && svc.scenes[s].actionCount > 0)
+        out.push({ kind: "scene", uid: svc.scenes[s].id })
     }
     for (var r = 0; r < svc.rooms.length; r++) {
       var devices = svc.rooms[r].devices
       for (var d = 0; d < devices.length; d++) {
         var device = devices[d]
         if (device.controllable && device.reachable)
-          out.push({ kind: "device", name: device.name, brightness: device.hasBrightness })
+          out.push({ kind: "device", uid: device.id, brightness: device.hasBrightness })
       }
     }
     return out
@@ -191,9 +294,9 @@ Panel {
     cursorIndex = Math.max(0, Math.min(flatRows.length - 1, cursorIndex + delta))
   }
 
-  function focusRow(kind, name) {
+  function focusRow(kind, uid) {
     for (var i = 0; i < flatRows.length; i++) {
-      if (flatRows[i].kind === kind && flatRows[i].name === name) {
+      if (flatRows[i].kind === kind && flatRows[i].uid === uid) {
         cursorActive = true
         cursorIndex = i
         return
@@ -201,36 +304,28 @@ Panel {
     }
   }
 
-  function rowHasCursor(kind, name) {
+  function rowHasCursor(kind, uid) {
     if (!cursorActive) return false
     var row = flatRows[cursorIndex]
-    return !!row && row.kind === kind && row.name === name
-  }
-
-  function deviceByName(name) {
-    for (var r = 0; r < svc.rooms.length; r++) {
-      var devices = svc.rooms[r].devices
-      for (var d = 0; d < devices.length; d++) if (devices[d].name === name) return devices[d]
-    }
-    return null
+    return !!row && row.kind === kind && row.uid === uid
   }
 
   function activateCursor() {
     var row = flatRows[cursorIndex]
     if (!row) return
-    if (row.kind === "scene") { svc.triggerScene(row.name); return }
-    var device = deviceByName(row.name)
-    if (device) svc.setPower(device.name, device.power !== true)
+    if (row.kind === "scene") { svc.triggerScene(row.uid); return }
+    var device = Model.findDevice(svc.rooms, row.uid)
+    if (device) svc.setPower(device.id, device.power !== true)
   }
 
   // Horizontal keys nudge the brightness of whatever light the cursor is on.
   function nudgeCursorBrightness(direction) {
     var row = flatRows[cursorIndex]
     if (!row || row.kind !== "device") return
-    var device = deviceByName(row.name)
+    var device = Model.findDevice(svc.rooms, row.uid)
     if (!device || !device.hasBrightness) return
     var current = device.brightness === null ? (device.power === true ? 100 : 0) : device.brightness
-    svc.setBrightness(device.name, current + direction * 10)
+    svc.setBrightness(device.id, current + direction * 10)
   }
 
   // Inserting or removing rows relays out the column, and for the frame it is
@@ -385,7 +480,9 @@ Panel {
           // ---------- Hero: home name · connection status · refresh ----------
           PanelHero {
             width: parent.width
-            title: svc.homeName !== "" ? svc.homeName : "HomeKit"
+            // Empty is the normal answer for a home with no scenes to carry
+            // the name, and for a Mac that has just been pointed elsewhere.
+            title: svc.homeName !== "" ? Model.displayText(svc.homeName) : "HomeKit"
             meta: root.statusLine
             detail: root.onPill
             foreground: root.foreground
@@ -394,6 +491,7 @@ Panel {
 
             iconComponent: Component {
               Text {
+                textFormat: Text.PlainText
                 text: "󰋜"  // nf-md-home_variant
                 color: svc.failed ? root.urgent : root.foreground
                 font.family: root.fontFamily
@@ -419,7 +517,14 @@ Panel {
             spacing: Style.space(2)
             visible: svc.failed
 
+            // Every Text in this panel pins textFormat rather than leaving it
+            // at AutoText: this one carries the CLI's stderr, others carry
+            // HomeKit names, and AutoText renders anything that looks like
+            // markup as rich text — which can fetch an <img> over the network.
+            // The upstream qs.Ui controls have no such property, so what they
+            // are handed goes through Model.displayText instead.
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: svc.errorMessage
               color: root.urgent
@@ -434,6 +539,7 @@ Panel {
             // message, near-full foreground, and arrow-led so the eye lands on
             // "here is what to do" rather than "here is what broke".
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               visible: svc.errorRemedy !== ""
               text: "󰁔  " + svc.errorRemedy  // nf-md-arrow_right
@@ -447,6 +553,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: !svc.failed && svc.actionStatus !== ""
             text: svc.actionStatus
@@ -476,6 +583,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Point this at a Mac running HomeClaw"
               color: root.foreground
@@ -506,6 +614,7 @@ Panel {
                   implicitHeight: stepText.implicitHeight
 
                   Text {
+                    textFormat: Text.PlainText
                     id: stepNumber
                     text: (step.index + 1) + "."
                     color: root.dim
@@ -515,6 +624,7 @@ Panel {
                   }
 
                   Text {
+                    textFormat: Text.PlainText
                     id: stepText
                     anchors.left: parent.left
                     anchors.leftMargin: Style.space(18)
@@ -534,6 +644,7 @@ Panel {
             // The one line a reader is meant to copy, so it gets its own row
             // at full foreground rather than being buried in step 4's prose.
             Text {
+              textFormat: Text.PlainText
               x: Style.space(18)
               width: parent.width - Style.space(18)
               text: "omarchy bar set andrew.homekit host <your-mac>"
@@ -550,6 +661,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Stuck? Run bin/homekit-doctor <your-mac> from the plugin directory "
                   + "(~/.config/omarchy/plugins/andrew.homekit) \u2014 it checks each step above "
@@ -590,11 +702,12 @@ Panel {
 
               Button {
                 id: sceneRow
+                required property string uid
                 required property string name
                 required property string subtitle
                 required property bool runnable
 
-                readonly property bool busy: svc.isSceneBusy(sceneRow.name)
+                readonly property bool busy: svc.isSceneBusy(sceneRow.uid)
 
                 bordered: true
                 text: sceneRow.name
@@ -604,14 +717,14 @@ Panel {
                 foreground: root.foreground
                 accent: root.foreground
                 fontFamily: root.fontFamily
-                hasCursor: root.rowHasCursor("scene", sceneRow.name)
+                hasCursor: root.rowHasCursor("scene", sceneRow.uid)
                 // An empty scene is shown for context but cannot be run.
                 enabled: sceneRow.runnable && !busy
                 opacity: sceneRow.runnable ? 1.0 : 0.4
 
                 onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(sceneRow)
-                onHovered: function(on) { if (on) root.focusRow("scene", sceneRow.name) }
-                onClicked: svc.triggerScene(sceneRow.name)
+                onHovered: function(on) { if (on) root.focusRow("scene", sceneRow.uid) }
+                onClicked: svc.triggerScene(sceneRow.uid)
               }
             }
           }
@@ -635,6 +748,7 @@ Panel {
               Column {
                 id: row
                 required property int index
+                required property string uid
                 required property string kind
                 required property string name
                 required property string category
@@ -647,7 +761,7 @@ Panel {
                 required property int brightness
 
                 readonly property bool isDevice: row.kind === "device"
-                readonly property bool busy: row.isDevice && svc.isDeviceBusy(row.name)
+                readonly property bool busy: row.isDevice && svc.isDeviceBusy(row.uid)
 
                 width: deviceColumn.width
                 spacing: row.isDevice ? 0 : Style.space(4)
@@ -691,15 +805,15 @@ Panel {
                   checked: row.power
                   foreground: root.foreground
                   fontFamily: root.fontFamily
-                  hasCursor: root.rowHasCursor("device", row.name)
+                  hasCursor: root.rowHasCursor("device", row.uid)
                   enabled: row.reachable
                   opacity: row.reachable ? (row.busy ? 0.7 : 1.0) : 0.45
 
                   onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(deviceToggle)
-                  onHovered: function(on) { if (on) root.focusRow("device", row.name) }
+                  onHovered: function(on) { if (on) root.focusRow("device", row.uid) }
                   onClicked: {
                     if (row.busy) return
-                    svc.setPower(row.name, !row.power)
+                    svc.setPower(row.uid, !row.power)
                   }
                 }
 
@@ -724,7 +838,7 @@ Panel {
                   enabled: row.reachable && !row.busy
                   opacity: row.reachable ? (row.busy ? 0.7 : 1.0) : 0.45
 
-                  onReleased: function(value) { svc.setBrightness(row.name, value) }
+                  onReleased: function(value) { svc.setBrightness(row.uid, value) }
                 }
 
                 // Read-only accessory (sensors, and anything whose category
@@ -736,6 +850,7 @@ Panel {
                   opacity: row.reachable ? 1.0 : 0.45
 
                   Text {
+                    textFormat: Text.PlainText
                     anchors.left: parent.left
                     anchors.leftMargin: Style.spacing.rowPaddingX
                     anchors.verticalCenter: parent.verticalCenter
@@ -748,6 +863,7 @@ Panel {
                   }
 
                   Text {
+                    textFormat: Text.PlainText
                     anchors.right: parent.right
                     anchors.rightMargin: Style.spacing.rowPaddingX
                     anchors.verticalCenter: parent.verticalCenter
@@ -766,6 +882,7 @@ Panel {
 
           // ---------- Empty state ----------
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: root.configured && svc.everLoaded && svc.rooms.length === 0 && !svc.failed
             text: root.hiddenRoomsSetting.length > 0
@@ -778,6 +895,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: root.configured && !svc.everLoaded && !svc.failed
             text: "Loading accessories…"
@@ -788,6 +906,7 @@ Panel {
 
           // ---------- Footer hint ----------
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: root.configured
             text: "↑/↓ select · ⏎ toggle · ←/→ dim · R refresh"

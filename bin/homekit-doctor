@@ -9,8 +9,14 @@
 # With no arguments it reads the widget's own settings out of
 # ~/.config/omarchy/shell.json, so it checks what the bar is actually using.
 #
-# Only read-only HomeClaw subcommands are ever run (status/list). Nothing here
-# changes an accessory, a scene, or anything else in the home.
+# Only read-only HomeClaw subcommands are ever run — status, scenes and list,
+# which are exactly the three reads the panel itself makes. Nothing here changes
+# an accessory, a scene, or anything else in the home.
+#
+# Everything that arrives from the far side is treated as hostile: counts are
+# type-checked before they are compared, replies must actually be JSON arrays,
+# and every remote string is stripped of terminal control sequences before it is
+# printed. A compromised Mac gets to fail this script, not to drive it.
 
 set -uo pipefail
 
@@ -36,50 +42,113 @@ if [[ -t 1 ]]; then
   BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'; RED=$'\033[31m'
   YELLOW=$'\033[33m'; RESET=$'\033[0m'
 else
-  BOLD=""; DIM=""; GREEN=""; RED=""; YELLOW=""; RESET=""
+  BOLD=""; DIM=""; GREEN=""; RESET=""; RED=""; YELLOW=""
 fi
 
+ESC=$'\033'
+BEL=$'\a'
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Every string that came from the Mac — remote stderr, CLI output, Spotlight
+# paths, the home name — passes through here on its way to the terminal. Escape
+# sequences in that text could otherwise repaint the screen, forge a line of
+# this script's own output, install a hyperlink, or write the clipboard.
+#
+# Three passes, in this order:
+#
+#  1. iconv repairs the text to valid UTF-8, dropping (-c) every byte that is
+#     not part of a well-formed sequence. That is what disarms a *raw* C1
+#     control such as 0x9b, which a terminal reads as CSI: on its own it is
+#     invalid UTF-8, so it never reaches the screen. It cannot be deleted by
+#     byte value instead — 0x80-0x9f are also the continuation bytes of every
+#     legitimate multi-byte character, so a blind `tr -d '\200-\237'` would eat
+#     the middle of "—", "✔" or "é". Only where iconv is missing does the last
+#     pass fall back to dropping every non-ASCII byte outright, which loses
+#     such text rather than leaving half a character behind — safety over
+#     fidelity, on a system too small to have glibc's iconv.
+#  2. sed removes whole escape sequences, so nothing legible is left behind,
+#     and the \302 pair removes the C1 controls in their UTF-8 form.
+#  3. tr removes every remaining C0 control (tab and newline are the two
+#     deliberate exceptions) and DEL.
+#
+# What a C1 introducer was introducing survives as inert text — "31;1m" rather
+# than a colour change — which is no different from any other remote string
+# reaching the terminal as text.
+#
+# This is applied inside the printing helpers rather than at each call site so
+# no field can be forgotten.
+scrub() {
+  local repair=(cat) strip='\000-\010\013-\037\177'
+  if have iconv; then
+    repair=(iconv -c -f UTF-8 -t UTF-8)
+  else
+    strip='\000-\010\013-\037\177\200-\377'
+  fi
+
+  "${repair[@]}" 2>/dev/null |
+    LC_ALL=C sed \
+      -e "s%${ESC}\][^${BEL}${ESC}]*\(${BEL}\|${ESC}\\\\\)%%g" \
+      -e "s%${ESC}\[[0-9;:<=>?]*[/ -.]*[@-~]%%g" \
+      -e "s%${ESC}[@-Z\\\\-_]%%g" \
+      -e "s%${ESC}[/ -.]*[0-~]%%g" \
+      -e 's%\xc2[\x80-\x9f]%%g' |
+    LC_ALL=C tr -d "$strip"
+  return 0
+}
+
+# Single-line form of the above: a name or a path is printed as one line of a
+# report, so a newline inside one could otherwise forge a whole line of this
+# script's output ("✔ All checks passed"). Multi-line remote text is quoted by
+# detail() instead, where every line carries a visible "│" prefix.
+clean() { printf '%s' "$1" | scrub | tr '\n\t' '  '; }
+
+# Shell-safe rendering of a value inside a command we suggest the reader run.
+# A Spotlight path or a host name is not ours to trust, and copy-pasting an
+# unquoted one is how a diagnostic turns into an injection.
+q() { printf '%q' "$1"; }
+
 ok() {
-  printf '%s✔%s %s\n' "$GREEN" "$RESET" "$1"
+  printf '%s✔%s %s\n' "$GREEN" "$RESET" "$(clean "$1")"
   shift
   local line
-  for line in "$@"; do printf '  %s%s%s\n' "$DIM" "$line" "$RESET"; done
+  for line in "$@"; do printf '  %s%s%s\n' "$DIM" "$(clean "$line")" "$RESET"; done
 }
 
 warn() {
-  printf '%s!%s %s\n' "$YELLOW" "$RESET" "$1"
+  printf '%s!%s %s\n' "$YELLOW" "$RESET" "$(clean "$1")"
   shift
   local line
-  for line in "$@"; do printf '  %s%s%s\n' "$DIM" "$line" "$RESET"; done
+  for line in "$@"; do printf '  %s%s%s\n' "$DIM" "$(clean "$line")" "$RESET"; done
 }
 
 # First failure ends the run: every later step depends on this one, so their
 # output would only be noise on top of the one thing to fix.
 die() {
-  printf '%s✘%s %s%s%s\n' "$RED" "$RESET" "$BOLD" "$1" "$RESET"
+  printf '%s✘%s %s%s%s\n' "$RED" "$RESET" "$BOLD" "$(clean "$1")" "$RESET"
   shift
   local line
   for line in "$@"; do
     # detail() hands back its own already-indented, possibly multi-line quote of
     # the tool's real complaint; everything else is a single line to indent here.
     if [[ $line == *$'\n'* || $line == "  │ "* ]]; then
-      printf '%s\n' "$line"
+      printf '%s\n' "$(printf '%s' "$line" | scrub)"
     else
-      printf '  %s\n' "$line"
+      printf '  %s\n' "$(clean "$line")"
     fi
   done
   exit 1
 }
 
+# A quoted excerpt of whatever the failing tool actually said. Bounded in both
+# directions — three lines, 200 columns each — because the text is remote.
 detail() {
   local text="$1" line
-  line=$(printf '%s\n' "$text" | grep -v '^[[:space:]]*$' | head -n 3)
+  line=$(printf '%s\n' "$text" | scrub | grep -v '^[[:space:]]*$' | head -n 3 | cut -c 1-200)
   [[ -n $line ]] && printf '%s\n' "$line" | sed 's/^/  │ /'
 }
 
 # ---------------------------------------------------------------- helpers
-
-have() { command -v "$1" >/dev/null 2>&1; }
 
 # ssh joins its post-hostname arguments with spaces and hands the result to the
 # login shell on the Mac (zsh), so every remote word has to arrive pre-quoted
@@ -91,33 +160,173 @@ rquote() {
 
 # A stuck auth exchange would otherwise sit here forever; ConnectTimeout only
 # covers reaching the port.
+#
+# The `--` is the same one Model.sshArgs() emits: ssh parses a leading '-' on
+# the destination as one of its own options even though it is a separate argv
+# element, and -oProxyCommand=… would then run a command on THIS machine. Step 1
+# refuses such a host outright; this is the belt to that suspenders.
 run_ssh() {
   if have timeout; then
-    timeout 25 ssh "${ssh_opts[@]}" "$@"
+    timeout 25 ssh "${ssh_opts[@]}" -- "$@"
   else
-    ssh "${ssh_opts[@]}" "$@"
+    ssh "${ssh_opts[@]}" -- "$@"
   fi
+}
+
+# Bash arithmetic recursively evaluates the *contents* of a variable, command
+# substitutions inside array subscripts included, so `[[ $n -eq 0 ]]` on a
+# string that came off the network is a remote-code-execution primitive. Nothing
+# from the Mac reaches (( )), $(( )) or -eq without passing this first.
+is_count() { [[ $1 =~ ^[0-9]+$ ]]; }
+
+# status --json → $status_ready ("true"/"false"), $status_homes, $status_acc.
+# Returns non-zero if the reply is not an object carrying all three of `ready`,
+# `homes` and `accessories`, with a boolean and two non-negative integers in
+# them. A missing key is a wrong shape, not a zero: a reply this script does not
+# recognise must fail the step, never quietly report "0 accessories". Kept as a
+# pure function of its argument so it can be exercised on its own with hostile
+# input.
+#
+# Exit 2 means neither jq nor python3 is installed, which the caller reports
+# differently: with no parser the JSON cannot be validated at all, and guessing
+# with grep would let malformed output pass as healthy.
+parse_status() {
+  local json="$1" fields rc
+  status_ready=""; status_homes=""; status_acc=""
+
+  if have jq; then
+    fields=$(printf '%s' "$json" | jq -er '
+      if type != "object" then error("not an object") else . end
+      | if (has("ready") and has("homes") and has("accessories")) | not
+        then error("missing key") else . end
+      | .ready as $ready
+      | .homes as $homes
+      | .accessories as $acc
+      | if ($ready | type) != "boolean" then error("ready is not a boolean")
+        elif ($homes | type) != "number" or ($homes | floor) != $homes or $homes < 0
+          then error("homes is not a count")
+        elif ($acc | type) != "number" or ($acc | floor) != $acc or $acc < 0
+          then error("accessories is not a count")
+        else "\($ready)\n\($homes)\n\($acc)"
+        end
+    ' 2>/dev/null)
+    rc=$?
+  elif have python3; then
+    fields=$(printf '%s' "$json" | python3 -c '
+import json, sys
+
+def is_count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, dict):
+    sys.exit(1)
+if not all(key in data for key in ("ready", "homes", "accessories")):
+    sys.exit(1)
+ready = data["ready"]
+homes = data["homes"]
+acc = data["accessories"]
+if not isinstance(ready, bool) or not is_count(homes) or not is_count(acc):
+    sys.exit(1)
+print("true" if ready else "false")
+print(homes)
+print(acc)
+' 2>/dev/null)
+    rc=$?
+  else
+    return 2
+  fi
+
+  [[ $rc -eq 0 ]] || return 1
+  { IFS= read -r status_ready; IFS= read -r status_homes; IFS= read -r status_acc; } <<<"$fields"
+
+  [[ $status_ready == true || $status_ready == false ]] || return 1
+  is_count "$status_homes" || return 1
+  is_count "$status_acc" || return 1
+  return 0
+}
+
+# Element count of a JSON array on stdout; exit 1 if the text is not one, exit 2
+# if there is no parser here to tell. "Starts with a [" is not a JSON array —
+# `[not json` starts with one too — so with neither jq nor python3 installed
+# this refuses to answer rather than passing malformed output as healthy.
+json_array_count() {
+  local json="$1" n
+  if have jq; then
+    n=$(printf '%s' "$json" | jq -er '
+      if type == "array" then length else error("not an array") end
+    ' 2>/dev/null) || return 1
+  elif have python3; then
+    n=$(printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, list):
+    sys.exit(1)
+print(len(data))
+' 2>/dev/null) || return 1
+  else
+    return 2
+  fi
+  is_count "$n" || return 1
+  printf '%s' "$n"
 }
 
 # Pulls one key out of this plugin's entry in shell.json. The entry lives inside
 # whichever bar section holds the widget, so it is searched for by id rather
 # than by a fixed path.
+#
+# The exit status carries the reason, because "the file is truncated" and "the
+# widget has never been pointed at a Mac" want completely different advice:
+#   0 value printed   3 no such entry/key   4 value is not a string
+#   5 not valid JSON  6 file does not exist 7 file cannot be read
+#   2 neither jq nor python3 installed
+#   8 value contains control characters
+#
+# 8 exists because Bash cannot carry such a value out of a command substitution
+# intact: $(…) strips every trailing newline and discards NUL bytes outright, so
+# a JSON host of "mac\n" or "mac\u0000evil" would arrive here as a clean-looking
+# "mac" or "macevil" and the doctor would then test a *different* host from the
+# one the widget reads and rejects. The check therefore happens inside the
+# parser, before the value is ever printed.
 setting_of() {
-  local key="$1"
-  [[ -r $SHELL_JSON ]] || return 1
+  local key="$1" out rc tag
+  [[ -e $SHELL_JSON ]] || return 6
+  [[ -r $SHELL_JSON ]] || return 7
 
   if have jq; then
-    jq -r --arg id "$PLUGIN_ID" --arg key "$key" '
-      [.. | objects | select(.id? == $id)] | .[0][$key] // ""
-    ' "$SHELL_JSON" 2>/dev/null
-    return 0
-  fi
-
-  if have python3; then
-    python3 - "$SHELL_JSON" "$PLUGIN_ID" "$key" <<'PY' 2>/dev/null
+    out=$(jq -r --arg id "$PLUGIN_ID" --arg key "$key" '
+      [.. | objects | select(.id? == $id)] as $entries
+      | if ($entries | length) == 0 then "missing"
+        else ($entries[0][$key]) as $v
+          | if $v == null then "missing"
+            elif ($v | type) != "string" then "nonstring"
+            elif $v == "" then "missing"
+            elif ($v | test("[\\x00-\\x1f\\x7f\\x{0080}-\\x{009f}]")) then "control"
+            else "value\n" + $v
+            end
+        end
+    ' "$SHELL_JSON" 2>/dev/null)
+    rc=$?
+    [[ $rc -eq 0 ]] || return 5
+  elif have python3; then
+    out=$(python3 - "$SHELL_JSON" "$PLUGIN_ID" "$key" <<'PY'
 import json, sys
 
 path, plugin_id, key = sys.argv[1], sys.argv[2], sys.argv[3]
+
+try:
+    with open(path) as handle:
+        data = json.load(handle)
+except OSError:
+    sys.exit(7)
+except ValueError:
+    sys.exit(5)
 
 def walk(node):
     if isinstance(node, dict):
@@ -129,23 +338,50 @@ def walk(node):
         for value in node:
             yield from walk(value)
 
-try:
-    with open(path) as handle:
-        data = json.load(handle)
-except Exception:
-    sys.exit(1)
+def has_control(text):
+    return any(ord(ch) < 32 or ord(ch) == 127 or 0x80 <= ord(ch) <= 0x9f
+               for ch in text)
 
 for entry in walk(data):
     value = entry.get(key)
-    if value not in (None, ""):
-        print(value)
-        break
+    if value is None:
+        print("missing")
+    elif not isinstance(value, str):
+        print("nonstring")
+    elif value == "":
+        print("missing")
+    elif has_control(value):
+        print("control")
+    else:
+        sys.stdout.write("value\n" + value)
+    sys.exit(0)
+
+print("missing")
 PY
-    return 0
+    )
+    rc=$?
+    [[ $rc -eq 0 ]] || return "$rc"
+  else
+    return 2
   fi
 
-  return 2
+  tag=${out%%$'\n'*}
+  case $tag in
+  value)
+    printf '%s' "${out#value$'\n'}"
+    return 0
+    ;;
+  nonstring) return 4 ;;
+  control) return 8 ;;
+  *) return 3 ;;
+  esac
 }
+
+# Sourcing with HOMEKIT_DOCTOR_LIB=1 stops here, so the parsing and validation
+# helpers above can be exercised in isolation without contacting anything.
+if [[ ${HOMEKIT_DOCTOR_LIB:-0} == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 # ------------------------------------------------------------------ args
 
@@ -154,11 +390,15 @@ if [[ ${1:-} == -h || ${1:-} == --help ]]; then
 Usage: homekit-doctor [host] [cliPath]
 
 Checks, in order: the host setting, local ssh-agent, SSH to the Mac, the
-homeclaw-cli binary, and whether HomeClaw itself is answering. Stops at the
-first failure and prints the fix for it.
+homeclaw-cli binary, whether HomeClaw itself is answering, and finally that
+both reads the panel makes — scenes --json and list --json — come back as
+JSON. Stops at the first failure and prints the fix for it.
 
 With no arguments, host and cliPath are read from
 $SHELL_JSON.
+
+Needs jq (or python3) on this machine: the last two steps check the shape of
+what the CLI replied, and with no parser here that cannot be checked at all.
 USAGE
   exit 0
 fi
@@ -167,26 +407,73 @@ host="${1:-}"
 cli_path="${2:-}"
 from_config=0
 
+config_problem() {
+  case "$1" in
+  2)
+    die "Cannot read $SHELL_JSON (no jq and no python3)" \
+      "Install jq, or pass the values directly:" \
+      "  homekit-doctor <your-mac> $(q "$DEFAULT_CLI_PATH")"
+    ;;
+  4)
+    die "The '$2' setting for $PLUGIN_ID is not a string" \
+      "$SHELL_JSON has it as a number, list or object, so the widget cannot use it" \
+      "either. Set it again to overwrite it:" \
+      "  omarchy bar set $PLUGIN_ID $2 <value>"
+    ;;
+  5)
+    die "$SHELL_JSON is not valid JSON" \
+      "Nothing can read the widget's settings while it is malformed — the shell" \
+      "included. Fix or restore it, then re-run:" \
+      "  jq . $(q "$SHELL_JSON")"
+    ;;
+  6)
+    die "$SHELL_JSON does not exist" \
+      "The shell writes it the first time a setting is set:" \
+      "  omarchy bar set $PLUGIN_ID host <your-mac>"
+    ;;
+  7)
+    die "$SHELL_JSON cannot be read" \
+      "It exists but this user cannot open it — check its ownership and mode:" \
+      "  ls -l $(q "$SHELL_JSON")"
+    ;;
+  8)
+    # Deliberately not printed: the value itself. Command substitution has
+    # already eaten its NULs and trailing newlines, so anything shown here would
+    # be a laundered version of what is actually in the file.
+    die "$2 setting contains control characters" \
+      "$SHELL_JSON holds a NUL, a newline or an escape character inside the" \
+      "value. The widget refuses such a setting, and this script will not test a" \
+      "trimmed version of it in its place. Set it again to overwrite it:" \
+      "  omarchy bar set $PLUGIN_ID $2 <value>"
+    ;;
+  *)
+    die "Cannot read the '$2' setting from $SHELL_JSON (code $1)" \
+      "Pass the values directly instead:" \
+      "  homekit-doctor <your-mac> $(q "$DEFAULT_CLI_PATH")"
+    ;;
+  esac
+}
+
 if [[ -z $host || -z $cli_path ]]; then
   if [[ -z $host ]]; then
     host=$(setting_of host)
     config_rc=$?
     from_config=1
+    # 3 (no entry yet) is not an error here: step 1 has the whole first-run
+    # explanation for an unset host.
+    [[ $config_rc -eq 0 || $config_rc -eq 3 ]] || config_problem "$config_rc" host
   fi
-  [[ -z $cli_path ]] && cli_path=$(setting_of cliPath)
-  if [[ ${config_rc:-0} -eq 2 ]]; then
-    die "Cannot read $SHELL_JSON (no jq and no python3)" \
-      "Install jq, or pass the values directly:" \
-      "  homekit-doctor <your-mac> $DEFAULT_CLI_PATH"
+  if [[ -z $cli_path ]]; then
+    cli_path=$(setting_of cliPath)
+    config_rc=$?
+    [[ $config_rc -eq 0 || $config_rc -eq 3 ]] || config_problem "$config_rc" cliPath
   fi
 fi
 
-host=${host//$'\n'/}
-cli_path=${cli_path//$'\n'/}
 [[ -z $cli_path ]] && cli_path="$DEFAULT_CLI_PATH"
 
 printf '%shomekit-doctor%s  host=%s  cliPath=%s%s\n\n' \
-  "$BOLD" "$RESET" "${host:-<unset>}" "$cli_path" \
+  "$BOLD" "$RESET" "$(clean "${host:-<unset>}")" "$(clean "$cli_path")" \
   "$([[ $from_config -eq 1 ]] && printf '  (from shell.json)')"
 
 # ---------------------------------------------------- 1. host is configured
@@ -204,6 +491,39 @@ if [[ -z $host ]]; then
     "    the user, port, and key stay in ssh's config and the widget only knows the name;" \
     "  · a plain LAN hostname or IP (mac-mini.local, 192.168.1.20)."
 fi
+
+# ssh treats a destination that starts with '-' as one of its own options even
+# though it is a separate argv element, and -oProxyCommand=… makes it run a
+# command on this machine. A host that shape is refused before ssh is ever
+# started; whitespace and control characters are refused with it, since neither
+# can be part of a real destination and both can forge terminal output.
+if [[ $host == -* ]]; then
+  die "Host setting starts with '-': $host" \
+    "ssh reads that as one of its own options rather than as a machine to reach" \
+    "(-oProxyCommand=… would run a command on THIS machine), so it is refused" \
+    "here and no ssh was started." \
+    "" \
+    "  omarchy bar set $PLUGIN_ID host <your-mac>" \
+    "" \
+    "If a real destination genuinely begins with a dash, give it a ~/.ssh/config" \
+    "alias and set the alias as the host instead."
+fi
+
+if [[ $host =~ [[:space:]] || $host =~ [[:cntrl:]] ]]; then
+  die "Host setting contains whitespace or control characters" \
+    "A destination is one word: no spaces, tabs, newlines or escape sequences." \
+    "Set it again to overwrite whatever is in shell.json now:" \
+    "" \
+    "  omarchy bar set $PLUGIN_ID host <your-mac>"
+fi
+
+if [[ $cli_path =~ [[:cntrl:]] ]]; then
+  die "cliPath setting contains control characters" \
+    "Set it again to overwrite it:" \
+    "" \
+    "  omarchy bar set $PLUGIN_ID cliPath $(q "$DEFAULT_CLI_PATH")"
+fi
+
 ok "Host is set: $host"
 
 # --------------------------------------------------- 2. local key material
@@ -249,7 +569,7 @@ if [[ $agent_ok -eq 0 ]]; then
       "there is no way in at all. Make one and install it on the Mac:" \
       "" \
       "  ssh-keygen -t ed25519" \
-      "  ssh-copy-id $host        # or paste ~/.ssh/id_ed25519.pub into its ~/.ssh/authorized_keys"
+      "  ssh-copy-id $(q "$host")        # or paste ~/.ssh/id_ed25519.pub into its ~/.ssh/authorized_keys"
   fi
   warn "Falling back to on-disk keys in ~/.ssh" "Found: ${key_files[*]}"
 fi
@@ -259,6 +579,9 @@ fi
 ssh_err=$(run_ssh "$host" true 2>&1 >/dev/null)
 ssh_rc=$?
 ssh_lower=$(printf '%s' "$ssh_err" | tr '[:upper:]' '[:lower:]')
+
+printf -v ssh_opts_q ' %q' "${ssh_opts[@]}"
+ssh_opts_q=${ssh_opts_q# }
 
 if [[ $ssh_rc -ne 0 ]]; then
   case "$ssh_lower" in
@@ -288,7 +611,7 @@ if [[ $ssh_rc -ne 0 ]]; then
     die "'$host' refused this machine's key" \
       "$(detail "$ssh_err")" \
       "The Mac does not trust the key ssh offered." \
-      "  · Install it:  ssh-copy-id $host" \
+      "  · Install it:  ssh-copy-id $(q "$host")" \
       "    or append ~/.ssh/id_ed25519.pub to ~/.ssh/authorized_keys on the Mac." \
       "  · Permissions on the Mac must be tight or sshd ignores the file:" \
       "      chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys" \
@@ -307,15 +630,15 @@ if [[ $ssh_rc -ne 0 ]]; then
     die "Host key for '$host' does not match ~/.ssh/known_hosts" \
       "$(detail "$ssh_err")" \
       "Expected after a reinstall or a recycled Tailscale IP; alarming otherwise." \
-      "  · If you know why it changed: ssh-keygen -R $host, then ssh once by hand to accept." \
+      "  · If you know why it changed: ssh-keygen -R $(q "$host"), then ssh once by hand to accept." \
       "  · BatchMode never accepts a new key on its own, so a first-ever connection" \
-      "    must also be made by hand once: ssh $host true"
+      "    must also be made by hand once: ssh $(q "$host") true"
     ;;
   *)
     die "SSH to '$host' failed (exit $ssh_rc)" \
       "$(detail "$ssh_err")" \
       "Reproduce it verbosely to see which stage fails:" \
-      "  ssh -v ${ssh_opts[*]} $host true"
+      "  ssh -v $ssh_opts_q -- $(q "$host") true"
     ;;
   esac
 fi
@@ -334,20 +657,22 @@ if ! run_ssh "$host" test -x "$(rquote "$cli_path")" >/dev/null 2>&1; then
   fi
 
   if [[ -n $found ]]; then
+    # Spotlight's answer is remote text: it is printed scrubbed, and the command
+    # we suggest running is printed shell-quoted.
     suggested="$found/Contents/MacOS/homeclaw-cli"
     die "No executable at $cli_path on $host" \
       "Spotlight found the bundle somewhere else:" \
       "  $found" \
       "" \
       "Point the widget at it:" \
-      "  omarchy bar set $PLUGIN_ID cliPath $suggested"
+      "  omarchy bar set $PLUGIN_ID cliPath $(q "$suggested")"
   fi
 
   die "No executable at $cli_path on $host" \
     "Spotlight cannot find a HomeClaw bundle on that Mac either." \
     "  · Install HomeClaw from the Mac App Store (it ships the CLI inside the app)." \
     "  · Already installed elsewhere? Find it and set the path:" \
-    "      ssh $host 'mdfind \"kMDItemFSName == \\\"HomeClaw.app\\\"\"'" \
+    "      ssh $(q "$host") 'mdfind \"kMDItemFSName == \\\"HomeClaw.app\\\"\"'" \
     "      omarchy bar set $PLUGIN_ID cliPath <bundle>/Contents/MacOS/homeclaw-cli" \
     "  · The path must be absolute. A non-interactive sshd session on macOS gets a" \
     "    PATH without /opt/homebrew/bin, so a bare 'homeclaw-cli' is never found."
@@ -356,11 +681,22 @@ ok "homeclaw-cli is executable at $cli_path"
 
 # ------------------------------------------------ 5. HomeClaw itself answers
 
-status_err_file=$(mktemp)
-trap 'rm -f "$status_err_file"' EXIT
-status_out=$(run_ssh "$host" "$(rquote "$cli_path")" 'status' '--json' 2>"$status_err_file")
-status_rc=$?
-status_err=$(cat "$status_err_file")
+err_file=$(mktemp) || die "Cannot create a temporary file" "Check /tmp and \$TMPDIR."
+trap 'rm -f "$err_file"' EXIT
+
+# One read, run exactly as the widget runs it, with stdout, stderr and exit
+# status kept apart: a transport failure, a CLI refusal and a well-formed reply
+# of the wrong shape each need a different remedy.
+capture() {
+  cap_out=$(run_ssh "$host" "$(rquote "$cli_path")" "$@" 2>"$err_file")
+  cap_rc=$?
+  cap_err=$(cat "$err_file")
+}
+
+capture 'status' '--json'
+status_out=$cap_out
+status_err=$cap_err
+status_rc=$cap_rc
 
 if [[ $status_rc -ne 0 ]]; then
   die "homeclaw-cli could not talk to HomeClaw (exit $status_rc)" \
@@ -374,17 +710,38 @@ if [[ $status_rc -ne 0 ]]; then
     "    HomeKit → HomeClaw. Without it the app runs but sees no homes."
 fi
 
-if have jq; then
-  ready=$(printf '%s' "$status_out" | jq -r '.ready // false' 2>/dev/null)
-  homes=$(printf '%s' "$status_out" | jq -r '.homes // 0' 2>/dev/null)
-  accessories=$(printf '%s' "$status_out" | jq -r '.accessories // 0' 2>/dev/null)
-else
-  ready=$(printf '%s' "$status_out" | grep -o '"ready"[[:space:]]*:[[:space:]]*[a-z]*' | grep -o '[a-z]*$')
-  homes=$(printf '%s' "$status_out" | grep -o '"homes"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
-  accessories=$(printf '%s' "$status_out" | grep -o '"accessories"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+# Neither jq nor python3 here means the replies cannot be validated at all. A
+# grep for a familiar-looking key is not validation — `[not json` starts with a
+# bracket too — so the run stops rather than printing "All checks passed" over
+# output nobody parsed.
+no_json_parser() {
+  die "Cannot check what '$1 --json' returned on $host" \
+    "install jq (or python3) to validate the CLI's JSON output" \
+    "Neither is installed here, and every remaining check is a check on the" \
+    "shape of that JSON, so this run cannot honestly pass." \
+    "" \
+    "  sudo pacman -S jq" \
+    "" \
+    "The transport itself is proven by the steps above; only the replies are" \
+    "unverified."
+}
+
+parse_status "$status_out"
+parse_rc=$?
+
+[[ $parse_rc -eq 2 ]] && no_json_parser status
+
+if [[ $parse_rc -ne 0 ]]; then
+  die "Unexpected status JSON from homeclaw-cli" \
+    "$(detail "$status_out")" \
+    "'status --json' should answer with a boolean 'ready' and whole-number counts." \
+    "This reply is a different shape, so nothing here trusts it." \
+    "  · Check the path is really HomeClaw's CLI and not another program:" \
+    "      ssh $(q "$host") $(q "$cli_path") --help" \
+    "  · A newer HomeClaw may have changed the schema; update this plugin."
 fi
 
-if [[ $ready != true ]]; then
+if [[ $status_ready != true ]]; then
   die "HomeClaw answered but is not ready" \
     "$(detail "$status_out")" \
     "The app is up and its socket is live, but it has no usable home yet." \
@@ -395,36 +752,79 @@ if [[ $ready != true ]]; then
     "  · A cold start takes a few seconds to load the home; re-run this if it just launched."
 fi
 
-if [[ ${homes:-0} -eq 0 ]]; then
+if [[ $status_homes == 0 ]]; then
   warn "HomeClaw reports 0 homes" \
     "The widget will connect and show nothing. Check the Mac is signed in to the" \
     "iCloud account that owns the home, and that HomeKit access is granted."
 fi
 
-# ---------------------------------------------------------- 6. what it sees
+ok "HomeClaw is ready on $host" "$status_acc accessories in $status_homes home(s)"
 
+# ------------------------------------------- 6. the reads the panel makes
+
+# Steps 1–5 prove the transport; this step proves the two calls the panel is
+# actually built on. Both have to exit 0 AND come back as a JSON array, or the
+# run fails here — "All checks passed" is only allowed to mean that everything
+# the widget does was done.
+read_failed() {
+  local sub="$1" why="$2"
+  die "'$sub --json' $why on $host" \
+    "$(detail "${cap_err:-$cap_out}")" \
+    "This is the same read the panel makes, so the widget will fail the same way," \
+    "even though every step before this one works." \
+    "  · Exit 64 means homeclaw-cli refused the command outright — check its own help:" \
+    "      ssh $(q "$host") $(q "$cli_path") --help" \
+    "  · Anything else: quit and reopen HomeClaw on the Mac, and confirm HomeKit" \
+    "    access in System Settings → Privacy & Security → HomeKit."
+}
+
+capture 'scenes' '--json'
+[[ $cap_rc -eq 0 ]] || read_failed scenes "failed (exit $cap_rc)"
+[[ -n $cap_out ]] || read_failed scenes "exited 0 but returned nothing"
+scenes_out=$cap_out
+scene_count=$(json_array_count "$scenes_out")
+count_rc=$?
+[[ $count_rc -eq 2 ]] && no_json_parser scenes
+[[ $count_rc -eq 0 ]] || read_failed scenes "did not return a JSON array"
+
+# Decoration only, and only ever from a real parser: the name is read out of the
+# reply that was just validated as an array.
 home_name=""
-scenes_out=$(run_ssh "$host" "$(rquote "$cli_path")" 'scenes' '--json' 2>/dev/null)
 if [[ -n $scenes_out ]]; then
   if have jq; then
-    home_name=$(printf '%s' "$scenes_out" | jq -r '[.[].home_name] | map(select(. != null)) | .[0] // ""' 2>/dev/null)
-    scene_count=$(printf '%s' "$scenes_out" | jq -r 'length' 2>/dev/null)
-  else
-    home_name=$(printf '%s' "$scenes_out" | grep -o '"home_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')
-    scene_count=$(printf '%s' "$scenes_out" | grep -c '"home_name"')
+    home_name=$(printf '%s' "$scenes_out" |
+      jq -r '[.[]? | objects | .home_name? | strings] | .[0] // ""' 2>/dev/null)
+  elif have python3; then
+    home_name=$(printf '%s' "$scenes_out" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(data, list):
+    for row in data:
+        if isinstance(row, dict) and isinstance(row.get("home_name"), str):
+            print(row["home_name"])
+            break
+' 2>/dev/null)
   fi
 fi
+# Bounded before it is printed: the name is whatever someone typed into the
+# Home app, and it goes on one line of a summary.
+home_name=${home_name:0:64}
 
-# `list` is the same read the panel makes, so a count from it also proves the
-# call the widget actually depends on returns something parseable.
-if have jq; then
-  device_count=$(run_ssh "$host" "$(rquote "$cli_path")" 'list' '--json' 2>/dev/null | jq -r 'length' 2>/dev/null)
-fi
+capture 'list' '--json'
+[[ $cap_rc -eq 0 ]] || read_failed list "failed (exit $cap_rc)"
+[[ -n $cap_out ]] || read_failed list "exited 0 but returned nothing"
+device_count=$(json_array_count "$cap_out")
+count_rc=$?
+[[ $count_rc -eq 2 ]] && no_json_parser list
+[[ $count_rc -eq 0 ]] || read_failed list "did not return a JSON array"
 
-summary="HomeClaw is ready on $host"
+summary="Both panel reads work on $host"
 [[ -n $home_name ]] && summary="$summary — \"$home_name\""
 ok "$summary" \
-  "${accessories:-?} accessories in ${homes:-?} home(s)$([[ -n ${scene_count:-} ]] && printf ', %s scenes' "$scene_count")$([[ -n ${device_count:-} ]] && printf ' (list returns %s entries)' "$device_count")"
+  "list --json → $device_count accessories · scenes --json → $scene_count scenes"
 
 printf '\n%sAll checks passed.%s The widget should work; open the panel from the bar.\n' "$GREEN" "$RESET"
 printf 'If it still shows an error there, the shell may not see your ssh-agent —\n'
