@@ -6,7 +6,8 @@ import qs.Ui
 
 // qs.Ui.PanelSlider, minus wheel handling. Drag, click-to-set and the
 // right-click signal are byte-for-byte the upstream behaviour; only the
-// MouseArea's `onWheel` is gone.
+// MouseArea's `onWheel` is gone, plus preventStealing/onCanceled so drags
+// survive vertical drift inside the scrolling list (see the MouseArea).
 //
 // Upstream consumes every wheel tick over the track and emits `moved` AND
 // `released` per tick, off angleDelta.y — so a two-finger scroll down the
@@ -121,6 +122,13 @@ Item {
     hoverEnabled: true
     cursorShape: Qt.PointingHandCursor
     acceptedButtons: Qt.LeftButton | Qt.RightButton
+    // Hold the mouse grab for the whole drag. Without this the enclosing
+    // Flickable steals the grab as soon as the pointer drifts vertically past
+    // Qt's drag threshold, the drag dies mid-gesture, and — since a stolen
+    // grab delivers `canceled` rather than `released` — `dragging` was left
+    // stuck true, with hover moves steering the knob until the next click.
+    // Only mouse.x is read, so wandering above/below the track is fine.
+    preventStealing: true
 
     function valueFromX(x) {
       var clamped = Math.max(0, Math.min(track.width, x))
@@ -147,6 +155,15 @@ Item {
     }
     onReleased: function(mouse) {
       if (mouse.button !== Qt.LeftButton) return
+      root.dragging = false
+      root.released(root.liveValue)
+      root.liveValue = root.value
+    }
+    // Grab lost some other way (popup closed under us, window focus change).
+    // Treat it as a release at the last known value so drag state can never
+    // be stranded.
+    onCanceled: function() {
+      if (!root.dragging) return
       root.dragging = false
       root.released(root.liveValue)
       root.liveValue = root.value
