@@ -18,7 +18,7 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "host": "snively",
+      "host": "",
       "cliPath": "/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli",
       "icon": "󰋜",
       "pollSeconds": 10,
@@ -29,8 +29,8 @@
       {
         "key": "host",
         "type": "string",
-        "label": "SSH host running HomeClaw",
-        "defaultValue": "snively"
+        "label": "SSH host (or ~/.ssh/config alias) running HomeClaw",
+        "defaultValue": ""
       },
       {
         "key": "cliPath",

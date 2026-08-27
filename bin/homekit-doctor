@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+#
+# homekit-doctor — check every hop between this machine and HomeClaw on the Mac,
+# in the order the widget depends on them, and stop at the first broken one with
+# the remedy for that hop specifically.
+#
+#   homekit-doctor [host] [cliPath]
+#
+# With no arguments it reads the widget's own settings out of
+# ~/.config/omarchy/shell.json, so it checks what the bar is actually using.
+#
+# Only read-only HomeClaw subcommands are ever run (status/list). Nothing here
+# changes an accessory, a scene, or anything else in the home.
+
+set -uo pipefail
+
+SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
+PLUGIN_ID="andrew.homekit"
+DEFAULT_CLI_PATH="/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli"
+
+# Keep this list in sync with Model.sshArgs() in Model.js. It is copied verbatim
+# rather than trimmed so the doctor exercises the exact transport the widget
+# uses — including the shared control socket, which means a successful run also
+# leaves a warm master connection behind for the panel.
+ssh_opts=(
+  -o BatchMode=yes
+  -o ConnectTimeout=5
+  -o ControlMaster=auto
+  -o "ControlPath=${XDG_RUNTIME_DIR:-/tmp}/homekit-ssh-%C"
+  -o ControlPersist=300
+)
+
+# ----------------------------------------------------------------- output
+
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'; RED=$'\033[31m'
+  YELLOW=$'\033[33m'; RESET=$'\033[0m'
+else
+  BOLD=""; DIM=""; GREEN=""; RED=""; YELLOW=""; RESET=""
+fi
+
+ok() {
+  printf '%s✔%s %s\n' "$GREEN" "$RESET" "$1"
+  shift
+  local line
+  for line in "$@"; do printf '  %s%s%s\n' "$DIM" "$line" "$RESET"; done
+}
+
+warn() {
+  printf '%s!%s %s\n' "$YELLOW" "$RESET" "$1"
+  shift
+  local line
+  for line in "$@"; do printf '  %s%s%s\n' "$DIM" "$line" "$RESET"; done
+}
+
+# First failure ends the run: every later step depends on this one, so their
+# output would only be noise on top of the one thing to fix.
+die() {
+  printf '%s✘%s %s%s%s\n' "$RED" "$RESET" "$BOLD" "$1" "$RESET"
+  shift
+  local line
+  for line in "$@"; do
+    # detail() hands back its own already-indented, possibly multi-line quote of
+    # the tool's real complaint; everything else is a single line to indent here.
+    if [[ $line == *$'\n'* || $line == "  │ "* ]]; then
+      printf '%s\n' "$line"
+    else
+      printf '  %s\n' "$line"
+    fi
+  done
+  exit 1
+}
+
+detail() {
+  local text="$1" line
+  line=$(printf '%s\n' "$text" | grep -v '^[[:space:]]*$' | head -n 3)
+  [[ -n $line ]] && printf '%s\n' "$line" | sed 's/^/  │ /'
+}
+
+# ---------------------------------------------------------------- helpers
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ssh joins its post-hostname arguments with spaces and hands the result to the
+# login shell on the Mac (zsh), so every remote word has to arrive pre-quoted
+# for that shell. Same reasoning, same escaping as Model.quote().
+rquote() {
+  local s=${1//\'/\'\\\'\'}
+  printf "'%s'" "$s"
+}
+
+# A stuck auth exchange would otherwise sit here forever; ConnectTimeout only
+# covers reaching the port.
+run_ssh() {
+  if have timeout; then
+    timeout 25 ssh "${ssh_opts[@]}" "$@"
+  else
+    ssh "${ssh_opts[@]}" "$@"
+  fi
+}
+
+# Pulls one key out of this plugin's entry in shell.json. The entry lives inside
+# whichever bar section holds the widget, so it is searched for by id rather
+# than by a fixed path.
+setting_of() {
+  local key="$1"
+  [[ -r $SHELL_JSON ]] || return 1
+
+  if have jq; then
+    jq -r --arg id "$PLUGIN_ID" --arg key "$key" '
+      [.. | objects | select(.id? == $id)] | .[0][$key] // ""
+    ' "$SHELL_JSON" 2>/dev/null
+    return 0
+  fi
+
+  if have python3; then
+    python3 - "$SHELL_JSON" "$PLUGIN_ID" "$key" <<'PY' 2>/dev/null
+import json, sys
+
+path, plugin_id, key = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def walk(node):
+    if isinstance(node, dict):
+        if node.get("id") == plugin_id:
+            yield node
+        for value in node.values():
+            yield from walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from walk(value)
+
+try:
+    with open(path) as handle:
+        data = json.load(handle)
+except Exception:
+    sys.exit(1)
+
+for entry in walk(data):
+    value = entry.get(key)
+    if value not in (None, ""):
+        print(value)
+        break
+PY
+    return 0
+  fi
+
+  return 2
+}
+
+# ------------------------------------------------------------------ args
+
+if [[ ${1:-} == -h || ${1:-} == --help ]]; then
+  cat <<USAGE
+Usage: homekit-doctor [host] [cliPath]
+
+Checks, in order: the host setting, local ssh-agent, SSH to the Mac, the
+homeclaw-cli binary, and whether HomeClaw itself is answering. Stops at the
+first failure and prints the fix for it.
+
+With no arguments, host and cliPath are read from
+$SHELL_JSON.
+USAGE
+  exit 0
+fi
+
+host="${1:-}"
+cli_path="${2:-}"
+from_config=0
+
+if [[ -z $host || -z $cli_path ]]; then
+  if [[ -z $host ]]; then
+    host=$(setting_of host)
+    config_rc=$?
+    from_config=1
+  fi
+  [[ -z $cli_path ]] && cli_path=$(setting_of cliPath)
+  if [[ ${config_rc:-0} -eq 2 ]]; then
+    die "Cannot read $SHELL_JSON (no jq and no python3)" \
+      "Install jq, or pass the values directly:" \
+      "  homekit-doctor <your-mac> $DEFAULT_CLI_PATH"
+  fi
+fi
+
+host=${host//$'\n'/}
+cli_path=${cli_path//$'\n'/}
+[[ -z $cli_path ]] && cli_path="$DEFAULT_CLI_PATH"
+
+printf '%shomekit-doctor%s  host=%s  cliPath=%s%s\n\n' \
+  "$BOLD" "$RESET" "${host:-<unset>}" "$cli_path" \
+  "$([[ $from_config -eq 1 ]] && printf '  (from shell.json)')"
+
+# ---------------------------------------------------- 1. host is configured
+
+if [[ -z $host ]]; then
+  die "No host configured for $PLUGIN_ID" \
+    "The widget does not guess: point it at the Mac running HomeClaw." \
+    "" \
+    "  omarchy bar set $PLUGIN_ID host <your-mac>" \
+    "" \
+    "Anything ssh can resolve works as <your-mac>:" \
+    "  · a Tailscale MagicDNS name (mac-mini.tail1234.ts.net, or just mac-mini)," \
+    "    which keeps working from outside the house;" \
+    "  · a ~/.ssh/config alias such as 'homekit-mac', which is the tidiest option —" \
+    "    the user, port, and key stay in ssh's config and the widget only knows the name;" \
+    "  · a plain LAN hostname or IP (mac-mini.local, 192.168.1.20)."
+fi
+ok "Host is set: $host"
+
+# --------------------------------------------------- 2. local key material
+
+agent_ok=0
+if [[ -n ${SSH_AUTH_SOCK:-} ]]; then
+  if ssh-add -l >/dev/null 2>&1; then
+    key_count=$(ssh-add -l 2>/dev/null | grep -c . || true)
+    ok "ssh-agent has $key_count key(s) loaded" "SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
+    agent_ok=1
+  else
+    agent_rc=$?
+    if [[ $agent_rc -eq 1 ]]; then
+      warn "ssh-agent is running but holds no keys" \
+        "Add one with: ssh-add ~/.ssh/id_ed25519" \
+        "A key file that ssh finds by itself still works; continuing."
+    else
+      warn "SSH_AUTH_SOCK is set but no agent is listening on it" \
+        "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" \
+        "Continuing: ssh can still use an on-disk key."
+    fi
+  fi
+else
+  warn "SSH_AUTH_SOCK is not set in this shell" \
+    "The bar widget reads it from the environment it was started in, so if it is" \
+    "missing there too, every call fails with 'Permission denied' under BatchMode." \
+    "Check what the shell sees: systemctl --user show-environment | grep SSH_AUTH_SOCK"
+fi
+
+if [[ $agent_ok -eq 0 ]]; then
+  # No usable agent. On-disk keys are the fallback ssh will reach for, so their
+  # absence is the real failure — nothing can authenticate without either.
+  shopt -s nullglob
+  key_files=()
+  for candidate in "$HOME"/.ssh/id_*; do
+    [[ $candidate == *.pub ]] && continue
+    key_files+=("${candidate##*/}")
+  done
+  shopt -u nullglob
+  if [[ ${#key_files[@]} -eq 0 ]]; then
+    die "No ssh-agent keys and no ~/.ssh/id_* key files" \
+      "BatchMode=yes means the widget never prompts for a password: without a key" \
+      "there is no way in at all. Make one and install it on the Mac:" \
+      "" \
+      "  ssh-keygen -t ed25519" \
+      "  ssh-copy-id $host        # or paste ~/.ssh/id_ed25519.pub into its ~/.ssh/authorized_keys"
+  fi
+  warn "Falling back to on-disk keys in ~/.ssh" "Found: ${key_files[*]}"
+fi
+
+# ------------------------------------------------------------- 3. ssh works
+
+ssh_err=$(run_ssh "$host" true 2>&1 >/dev/null)
+ssh_rc=$?
+ssh_lower=$(printf '%s' "$ssh_err" | tr '[:upper:]' '[:lower:]')
+
+if [[ $ssh_rc -ne 0 ]]; then
+  case "$ssh_lower" in
+  *"could not resolve hostname"*|*"name or service not known"*|*"nodename nor servname"*)
+    die "Cannot resolve '$host'" \
+      "$(detail "$ssh_err")" \
+      "Nothing on this machine knows that name." \
+      "  · On Tailscale: check the machine is up and MagicDNS is on (tailscale status)," \
+      "    and try the full name, e.g. mac-mini.tail1234.ts.net." \
+      "  · On the LAN: mDNS names need the .local suffix (mac-mini.local)." \
+      "  · Or define it once in ~/.ssh/config and set that alias as the host:" \
+      "      Host homekit-mac" \
+      "        HostName 100.x.y.z" \
+      "        User you" \
+      "    then: omarchy bar set $PLUGIN_ID host homekit-mac"
+    ;;
+  *"connection timed out"*|*"operation timed out"*|*"no route to host"*|*"network is unreachable"*|*"host is down"*)
+    die "'$host' resolves but is not answering" \
+      "$(detail "$ssh_err")" \
+      "Almost always a sleeping or absent Mac." \
+      "  · Wake it and re-run. A Mac that serves the home has to stay awake:" \
+      "    System Settings → Energy / Battery → Options → 'Prevent automatic sleeping'" \
+      "    (a desktop Mac) or 'Wake for network access'." \
+      "  · Off-LAN? Only Tailscale (or a VPN) reaches it; a .local name will not."
+    ;;
+  *"permission denied"*|*"publickey"*|*"too many authentication failures"*)
+    die "'$host' refused this machine's key" \
+      "$(detail "$ssh_err")" \
+      "The Mac does not trust the key ssh offered." \
+      "  · Install it:  ssh-copy-id $host" \
+      "    or append ~/.ssh/id_ed25519.pub to ~/.ssh/authorized_keys on the Mac." \
+      "  · Permissions on the Mac must be tight or sshd ignores the file:" \
+      "      chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys" \
+      "  · Check the username: ssh defaults to '$USER', which may not exist there." \
+      "    Fix it in ~/.ssh/config rather than in the widget setting."
+    ;;
+  *"connection refused"*)
+    die "'$host' is up but nothing is listening on the SSH port" \
+      "$(detail "$ssh_err")" \
+      "Remote Login is off on the Mac." \
+      "  · System Settings → General → Sharing → turn on Remote Login," \
+      "    and make sure your user is in its allowed-users list." \
+      "  · If sshd runs on a non-standard port, put 'Port n' in ~/.ssh/config."
+    ;;
+  *"host key verification failed"*|*"remote host identification has changed"*)
+    die "Host key for '$host' does not match ~/.ssh/known_hosts" \
+      "$(detail "$ssh_err")" \
+      "Expected after a reinstall or a recycled Tailscale IP; alarming otherwise." \
+      "  · If you know why it changed: ssh-keygen -R $host, then ssh once by hand to accept." \
+      "  · BatchMode never accepts a new key on its own, so a first-ever connection" \
+      "    must also be made by hand once: ssh $host true"
+    ;;
+  *)
+    die "SSH to '$host' failed (exit $ssh_rc)" \
+      "$(detail "$ssh_err")" \
+      "Reproduce it verbosely to see which stage fails:" \
+      "  ssh -v ${ssh_opts[*]} $host true"
+    ;;
+  esac
+fi
+ok "SSH to $host works" "Key-based, non-interactive, under the widget's own options."
+
+# ------------------------------------------------- 4. the CLI binary exists
+
+if ! run_ssh "$host" test -x "$(rquote "$cli_path")" >/dev/null 2>&1; then
+  # Best-effort: ask Spotlight where the bundle actually landed. The bundle id
+  # is com.shahine.homeclaw, so the match has to be case-insensitive ("c").
+  found=$(run_ssh "$host" \
+    'mdfind' "$(rquote 'kMDItemCFBundleIdentifier == "*HomeClaw*"c')" 2>/dev/null | head -n 1)
+  if [[ -z $found ]]; then
+    found=$(run_ssh "$host" \
+      'mdfind' "$(rquote 'kMDItemFSName == "HomeClaw.app"')" 2>/dev/null | head -n 1)
+  fi
+
+  if [[ -n $found ]]; then
+    suggested="$found/Contents/MacOS/homeclaw-cli"
+    die "No executable at $cli_path on $host" \
+      "Spotlight found the bundle somewhere else:" \
+      "  $found" \
+      "" \
+      "Point the widget at it:" \
+      "  omarchy bar set $PLUGIN_ID cliPath $suggested"
+  fi
+
+  die "No executable at $cli_path on $host" \
+    "Spotlight cannot find a HomeClaw bundle on that Mac either." \
+    "  · Install HomeClaw from the Mac App Store (it ships the CLI inside the app)." \
+    "  · Already installed elsewhere? Find it and set the path:" \
+    "      ssh $host 'mdfind \"kMDItemFSName == \\\"HomeClaw.app\\\"\"'" \
+    "      omarchy bar set $PLUGIN_ID cliPath <bundle>/Contents/MacOS/homeclaw-cli" \
+    "  · The path must be absolute. A non-interactive sshd session on macOS gets a" \
+    "    PATH without /opt/homebrew/bin, so a bare 'homeclaw-cli' is never found."
+fi
+ok "homeclaw-cli is executable at $cli_path"
+
+# ------------------------------------------------ 5. HomeClaw itself answers
+
+status_err_file=$(mktemp)
+trap 'rm -f "$status_err_file"' EXIT
+status_out=$(run_ssh "$host" "$(rquote "$cli_path")" 'status' '--json' 2>"$status_err_file")
+status_rc=$?
+status_err=$(cat "$status_err_file")
+
+if [[ $status_rc -ne 0 ]]; then
+  die "homeclaw-cli could not talk to HomeClaw (exit $status_rc)" \
+    "$(detail "${status_err:-$status_out}")" \
+    "The CLI is only a client: it reaches the app over a local Unix socket, so" \
+    "HomeClaw.app has to be running on $host for any of this to work." \
+    "  · Open HomeClaw.app on the Mac and let it finish loading the home." \
+    "  · Turn on launch-at-login in its menu-bar menu, or the widget breaks every" \
+    "    time the Mac reboots." \
+    "  · Confirm HomeKit access was granted: System Settings → Privacy & Security →" \
+    "    HomeKit → HomeClaw. Without it the app runs but sees no homes."
+fi
+
+if have jq; then
+  ready=$(printf '%s' "$status_out" | jq -r '.ready // false' 2>/dev/null)
+  homes=$(printf '%s' "$status_out" | jq -r '.homes // 0' 2>/dev/null)
+  accessories=$(printf '%s' "$status_out" | jq -r '.accessories // 0' 2>/dev/null)
+else
+  ready=$(printf '%s' "$status_out" | grep -o '"ready"[[:space:]]*:[[:space:]]*[a-z]*' | grep -o '[a-z]*$')
+  homes=$(printf '%s' "$status_out" | grep -o '"homes"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+  accessories=$(printf '%s' "$status_out" | grep -o '"accessories"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+fi
+
+if [[ $ready != true ]]; then
+  die "HomeClaw answered but is not ready" \
+    "$(detail "$status_out")" \
+    "The app is up and its socket is live, but it has no usable home yet." \
+    "  · Grant HomeKit access: System Settings → Privacy & Security → HomeKit → HomeClaw," \
+    "    then quit and reopen the app." \
+    "  · The Mac's Apple Account must be signed in to the same iCloud/Home as the home," \
+    "    with Home app data enabled in iCloud settings." \
+    "  · A cold start takes a few seconds to load the home; re-run this if it just launched."
+fi
+
+if [[ ${homes:-0} -eq 0 ]]; then
+  warn "HomeClaw reports 0 homes" \
+    "The widget will connect and show nothing. Check the Mac is signed in to the" \
+    "iCloud account that owns the home, and that HomeKit access is granted."
+fi
+
+# ---------------------------------------------------------- 6. what it sees
+
+home_name=""
+scenes_out=$(run_ssh "$host" "$(rquote "$cli_path")" 'scenes' '--json' 2>/dev/null)
+if [[ -n $scenes_out ]]; then
+  if have jq; then
+    home_name=$(printf '%s' "$scenes_out" | jq -r '[.[].home_name] | map(select(. != null)) | .[0] // ""' 2>/dev/null)
+    scene_count=$(printf '%s' "$scenes_out" | jq -r 'length' 2>/dev/null)
+  else
+    home_name=$(printf '%s' "$scenes_out" | grep -o '"home_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')
+    scene_count=$(printf '%s' "$scenes_out" | grep -c '"home_name"')
+  fi
+fi
+
+# `list` is the same read the panel makes, so a count from it also proves the
+# call the widget actually depends on returns something parseable.
+if have jq; then
+  device_count=$(run_ssh "$host" "$(rquote "$cli_path")" 'list' '--json' 2>/dev/null | jq -r 'length' 2>/dev/null)
+fi
+
+summary="HomeClaw is ready on $host"
+[[ -n $home_name ]] && summary="$summary — \"$home_name\""
+ok "$summary" \
+  "${accessories:-?} accessories in ${homes:-?} home(s)$([[ -n ${scene_count:-} ]] && printf ', %s scenes' "$scene_count")$([[ -n ${device_count:-} ]] && printf ' (list returns %s entries)' "$device_count")"
+
+printf '\n%sAll checks passed.%s The widget should work; open the panel from the bar.\n' "$GREEN" "$RESET"
+printf 'If it still shows an error there, the shell may not see your ssh-agent —\n'
+printf 'compare: systemctl --user show-environment | grep SSH_AUTH_SOCK\n'

@@ -26,9 +26,13 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  // Read back by BarWidget.qml to tint the bar icon.
+  // Read back by BarWidget.qml to tint the bar icon and pick its tooltip. An
+  // unconfigured widget is not a broken one, so the bar stays neutral and says
+  // so rather than painting the urgent colour at someone who has installed the
+  // plugin thirty seconds ago.
   readonly property bool lastCallFailed: svc.failed
   readonly property string errorMessage: svc.errorMessage
+  readonly property bool configured: svc.configured
 
   function open() {
     openedFromHotkey = false
@@ -85,7 +89,7 @@ Panel {
   // that fires before the real inline entry arrives is simply the defaults;
   // every consumer below is a binding, so the real values slot in when they
   // land without any imperative re-application.
-  readonly property string hostSetting: String(setting("host", "snively"))
+  readonly property string hostSetting: String(setting("host", ""))
   readonly property string cliPathSetting: String(setting("cliPath", "/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli"))
   readonly property int pollSeconds: Math.max(3, Math.min(120, Number(setting("pollSeconds", 10)) || 10))
   readonly property var hiddenRoomsSetting: {
@@ -135,6 +139,7 @@ Panel {
 
   // --------------------------------------------------------- status lines
   readonly property string statusLine: {
+    if (!root.configured) return "Not configured"
     if (svc.failed) return svc.errorMessage
     if (svc.loading && !svc.everLoaded) return "Connecting to " + root.hostSetting + "…"
     if (!svc.everLoaded) return root.hostSetting
@@ -424,14 +429,20 @@ Panel {
               wrapMode: Text.WordWrap
             }
 
+            // The remedy is the half of a failure banner worth reading, so it
+            // is not a dimmer footnote under the symptom: same size as the
+            // message, near-full foreground, and arrow-led so the eye lands on
+            // "here is what to do" rather than "here is what broke".
             Text {
               width: parent.width
               visible: svc.errorRemedy !== ""
-              text: svc.errorRemedy
-              color: root.dim
+              text: "󰁔  " + svc.errorRemedy  // nf-md-arrow_right
+              color: root.foreground
+              opacity: 0.85
               font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
+              font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap
+              lineHeight: 1.2
             }
           }
 
@@ -445,15 +456,121 @@ Panel {
             elide: Text.ElideRight
           }
 
+          // ---------- First run: no host set yet ----------
+          //
+          // Stands in for the whole scenes/accessories body rather than sitting
+          // above it, because with no host there is nothing to sit above. The
+          // steps are the actual chain this widget depends on, in the order it
+          // walks them (app on the Mac -> sshd -> a name that resolves -> the
+          // setting), so whichever link a reader has not done yet is the one
+          // they are looking at.
+          Column {
+            id: setupCard
+            width: parent.width
+            spacing: Style.space(8)
+            visible: !root.configured
+
+            PanelSeparator {
+              width: parent.width
+              foreground: root.foreground
+            }
+
+            Text {
+              width: parent.width
+              text: "Point this at a Mac running HomeClaw"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.subtitle
+              font.bold: true
+              wrapMode: Text.WordWrap
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: [
+                  "Install HomeClaw from the Mac App Store. Open it once so macOS can grant it HomeKit access, and turn on launch-at-login in its menu bar item.",
+                  "On the Mac, enable Remote Login (System Settings \u2192 General \u2192 Sharing), then add this machine's ssh public key to ~/.ssh/authorized_keys there.",
+                  "Make the Mac reachable from here \u2014 a Tailscale MagicDNS name, or a Host alias in ~/.ssh/config. Running \"ssh <name> true\" should succeed with no password prompt.",
+                  "Then set the host:"
+                ]
+
+                Item {
+                  id: step
+                  required property int index
+                  required property var modelData
+
+                  width: setupCard.width
+                  implicitHeight: stepText.implicitHeight
+
+                  Text {
+                    id: stepNumber
+                    text: (step.index + 1) + "."
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                  }
+
+                  Text {
+                    id: stepText
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(18)
+                    anchors.right: parent.right
+                    text: String(step.modelData)
+                    color: root.foreground
+                    opacity: 0.9
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.WordWrap
+                    lineHeight: 1.25
+                  }
+                }
+              }
+            }
+
+            // The one line a reader is meant to copy, so it gets its own row
+            // at full foreground rather than being buried in step 4's prose.
+            Text {
+              x: Style.space(18)
+              width: parent.width - Style.space(18)
+              text: "omarchy bar set andrew.homekit host <your-mac>"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              wrapMode: Text.WrapAnywhere
+            }
+
+            PanelSeparator {
+              width: parent.width
+              foreground: root.foreground
+            }
+
+            Text {
+              width: parent.width
+              text: "Stuck? Run bin/homekit-doctor <your-mac> from the plugin directory "
+                  + "(~/.config/omarchy/plugins/andrew.homekit) \u2014 it checks each step above "
+                  + "and says which one is failing. The README there has the long version."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+              lineHeight: 1.25
+            }
+          }
+
           // ---------- Scenes ----------
           PanelSeparator {
             width: parent.width
-            visible: svc.scenes.length > 0
+            visible: root.configured && svc.scenes.length > 0
             foreground: root.foreground
           }
 
           PanelSectionHeader {
-            visible: svc.scenes.length > 0
+            visible: root.configured && svc.scenes.length > 0
             text: "Scenes"
             foreground: root.foreground
             fontFamily: root.fontFamily
@@ -466,7 +583,7 @@ Panel {
           Flow {
             width: parent.width
             spacing: Style.space(6)
-            visible: svc.scenes.length > 0
+            visible: root.configured && svc.scenes.length > 0
 
             Repeater {
               model: svc.scenesModel
@@ -509,7 +626,7 @@ Panel {
           Column {
             id: deviceColumn
             width: parent.width
-            visible: svc.rowsModel.count > 0
+            visible: root.configured && svc.rowsModel.count > 0
             spacing: Style.space(4)
 
             Repeater {
@@ -650,7 +767,7 @@ Panel {
           // ---------- Empty state ----------
           Text {
             width: parent.width
-            visible: svc.everLoaded && svc.rooms.length === 0 && !svc.failed
+            visible: root.configured && svc.everLoaded && svc.rooms.length === 0 && !svc.failed
             text: root.hiddenRoomsSetting.length > 0
               ? "Every room is hidden by the hiddenRooms setting."
               : "No accessories reported by HomeClaw."
@@ -662,7 +779,7 @@ Panel {
 
           Text {
             width: parent.width
-            visible: !svc.everLoaded && !svc.failed
+            visible: root.configured && !svc.everLoaded && !svc.failed
             text: "Loading accessories…"
             color: root.dim
             font.family: root.fontFamily
@@ -672,6 +789,7 @@ Panel {
           // ---------- Footer hint ----------
           Text {
             width: parent.width
+            visible: root.configured
             text: "↑/↓ select · ⏎ toggle · ←/→ dim · R refresh"
             horizontalAlignment: Text.AlignRight
             color: root.dim

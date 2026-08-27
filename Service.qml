@@ -20,9 +20,18 @@ import "Model.js" as Model
 Item {
   id: root
 
-  property string host: "snively"
+  property string host: ""
   property string cliPath: "/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli"
   property var hiddenRooms: []
+
+  // A fresh install has no host at all. Nothing here may launch ssh until one
+  // is set: an empty host would make ssh try to connect to the literal string
+  // "" and the widget would report an unreachable Mac the user never named.
+  readonly property bool configured: String(host).trim() !== ""
+
+  // Emptying the host retires whatever the previous one failed with; the panel
+  // shows the setup card in place of the error.
+  onConfiguredChanged: if (!configured) clearFailure()
 
   // Per-user runtime dir keeps the control socket out of shared /tmp. %C is
   // ssh's hash of host/port/user, so several hosts never collide.
@@ -222,6 +231,7 @@ Item {
 
   // ---------------------------------------------------------------- reads
   function refresh() {
+    if (!root.configured) return
     if (root.loading) return
     root.loading = true
 
@@ -281,6 +291,7 @@ Item {
 
   // --------------------------------------------------------------- writes
   function setCharacteristic(name, property, value, optimistic, label) {
+    if (!root.configured) { root.flashStatus("Set a host first"); return }
     if (root.isDeviceBusy(name)) return
     markWrite(name, 1)
     applyOverride(name, optimistic)
@@ -314,6 +325,7 @@ Item {
   }
 
   function triggerScene(name) {
+    if (!root.configured) { root.flashStatus("Set a host first"); return }
     if (root.isSceneBusy(name)) return
     markScene(name, true)
     runJob(["trigger", name], function(exitCode, out, err) {

@@ -53,6 +53,11 @@ BarWidget {
   // the state of the last call actually made — not a live health check.
   readonly property bool lastCallFailed: panelLoader.item ? panelLoader.item.lastCallFailed === true : false
 
+  // A widget nobody has pointed at a Mac yet has not failed at anything, so it
+  // must not wear the urgent colour. Default true while the panel loads so the
+  // icon never flashes "unconfigured" during startup.
+  readonly property bool configured: panelLoader.item ? panelLoader.item.configured !== false : true
+
   visible: true
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -79,10 +84,12 @@ BarWidget {
     slotSize: Style.bar.statusSlot
     // WidgetButton paints `activeColor` (the theme's urgent/error color)
     // instead of the bar foreground while `active` is set.
-    active: root.lastCallFailed
-    tooltipText: root.lastCallFailed
-      ? (panelLoader.item ? String(panelLoader.item.errorMessage) : "HomeKit unavailable")
-      : ""
+    active: root.lastCallFailed && root.configured
+    tooltipText: !root.configured
+      ? "HomeKit: not configured — set a host"
+      : (root.lastCallFailed
+          ? (panelLoader.item ? String(panelLoader.item.errorMessage) : "HomeKit unavailable")
+          : "")
 
     onPressed: function(b) {
       if (b === Qt.MiddleButton) root.refresh()

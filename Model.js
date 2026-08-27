@@ -239,7 +239,7 @@ function sceneSubtitle(scene) {
 
 function renderRow(kind, name, device) {
   return {
-    key: kind + " " + String(name),
+    key: kind + "\u0000" + String(name),
     kind: kind,
     name: String(name),
     category: device ? String(device.category) : "",
@@ -363,6 +363,31 @@ function firstLine(text) {
   return ""
 }
 
+// Every remedy names the next concrete thing to do — the exact command, the
+// exact file — because the person hitting one of these is usually setting the
+// widget up for the first time and has no idea which half of the chain
+// (network, ssh, CLI, app) just failed.
+function sshRemedy(host) {
+  return "Check the host name (Tailscale MagicDNS name or ~/.ssh/config alias) "
+       + "and that the Mac is awake: run bin/homekit-doctor " + host
+}
+
+function authRemedy() {
+  return "Key auth failed. Add this machine's public key to ~/.ssh/authorized_keys "
+       + "on the Mac, and make sure the shell can see your ssh-agent "
+       + "(SSH_AUTH_SOCK in the Hyprland env or systemctl --user import-environment; see README)."
+}
+
+function cliRemedy(cliPath) {
+  return "homeclaw-cli not found at " + cliPath
+       + ". Set cliPath: omarchy bar set andrew.homekit cliPath <path>"
+}
+
+function appRemedy(host) {
+  return "HomeClaw.app isn't running on " + host
+       + ". Open it (and enable launch-at-login in its menu)."
+}
+
 // Three failures look identical from the shell (non-zero exit, some stderr)
 // but need three different remedies, so they are told apart here rather than
 // smeared into one "something went wrong".
@@ -378,22 +403,26 @@ function classifyFailure(exitCode, stderr, host, cliPath) {
 
   if (exitCode === 255 || lower.indexOf("ssh:") === 0 || lower.indexOf("ssh_exchange") >= 0) {
     if (lower.indexOf("could not resolve hostname") >= 0)
-      return { kind: "ssh", message: "Cannot resolve " + host, remedy: "Check the host setting or your DNS/mDNS." }
+      return { kind: "ssh", message: "Cannot resolve " + host, remedy: sshRemedy(host) }
     if (lower.indexOf("permission denied") >= 0 || lower.indexOf("publickey") >= 0)
-      return { kind: "ssh", message: "SSH key rejected by " + host, remedy: "Is ssh-agent running with a key " + host + " trusts?" }
+      return { kind: "ssh", message: "SSH key rejected by " + host, remedy: authRemedy() }
     if (lower.indexOf("timed out") >= 0 || lower.indexOf("no route to host") >= 0 || lower.indexOf("connection refused") >= 0)
-      return { kind: "ssh", message: host + " is not answering", remedy: "Wake the Mac and confirm Remote Login is on." }
-    return { kind: "ssh", message: "SSH to " + host + " failed", remedy: detail }
+      return { kind: "ssh", message: host + " is not answering", remedy: sshRemedy(host) }
+    return {
+      kind: "ssh",
+      message: detail !== "" ? "SSH to " + host + " failed: " + detail : "SSH to " + host + " failed",
+      remedy: sshRemedy(host)
+    }
   }
 
   if (exitCode === 127 || lower.indexOf("no such file") >= 0 || lower.indexOf("command not found") >= 0)
-    return { kind: "cli-missing", message: "homeclaw-cli not found on " + host, remedy: "Expected it at " + cliPath + "." }
+    return { kind: "cli-missing", message: "homeclaw-cli not found on " + host, remedy: cliRemedy(cliPath) }
 
   if (lower.indexOf("socket") >= 0 || lower.indexOf("not running") >= 0
       || lower.indexOf("could not connect") >= 0 || lower.indexOf("couldn't connect") >= 0
       || lower.indexOf("connection failed") >= 0 || lower.indexOf("xpc") >= 0
       || lower.indexOf("no homes") >= 0 || lower.indexOf("not ready") >= 0)
-    return { kind: "app", message: "HomeClaw is not responding on " + host, remedy: "Launch HomeClaw.app on " + host + " and let it finish loading the home." }
+    return { kind: "app", message: "HomeClaw is not responding on " + host, remedy: appRemedy(host) }
 
   return {
     kind: "cli",
