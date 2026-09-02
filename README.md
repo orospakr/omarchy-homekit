@@ -392,7 +392,19 @@ with a 5-minute `ControlPersist` collapses them onto one connection, so only
 the first call after a lull pays for a handshake. The doctor deliberately uses
 the identical option list (kept in sync by hand, with a comment on both sides)
 so that what it proves is exactly what the widget will do — control socket
-included.
+included. That socket lives only in the per-user `XDG_RUNTIME_DIR` (0700 by
+the XDG spec; the doctor verifies ownership and mode, since bash can): with no
+such directory, multiplexing is skipped entirely rather than falling back to a
+predictable path in shared `/tmp`.
+
+**Bounded input.** Everything the Mac sends is capped before it is believed.
+The transport reads at most 4 MiB of stdout and 256 KiB of stderr per call —
+an endpoint that exceeds that is terminated, not buffered — and the model caps
+what valid JSON may become: at most 1024 accessories, 512 scenes, 12 readings
+per accessory, and 512 characters per label reach the UI. Every remote call,
+in the widget and the doctor both, runs under a hard deadline with a
+TERM-then-KILL reaping path, and there is a global ceiling on concurrent ssh
+processes, so no IPC caller can pile them up without bound.
 
 **Open-only polling.** Reads run when the panel opens and on a timer while it
 stays open. An SSH round trip per tick behind a closed panel would be absurd,

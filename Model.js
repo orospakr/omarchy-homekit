@@ -45,18 +45,38 @@ function sshArgs(host, cliPath, args, controlPath) {
   var command = [
     "ssh",
     "-o", "BatchMode=yes",
-    "-o", "ConnectTimeout=5",
-    "-o", "ControlMaster=auto",
-    "-o", "ControlPath=" + String(controlPath),
-    "-o", "ControlPersist=300",
-    // Ends option parsing: belt and braces beside hostIsValid above.
-    "--",
-    String(host),
-    quote(cliPath)
+    "-o", "ConnectTimeout=5"
   ]
+  // No control path means no private per-user runtime directory to keep the
+  // socket in. The old fallback was shared /tmp — a predictable path another
+  // local user could claim first — so multiplexing is simply not used then:
+  // every call pays its own handshake rather than trusting a shared directory.
+  var control = String(controlPath === undefined || controlPath === null ? "" : controlPath)
+  if (control !== "") {
+    command.push(
+      "-o", "ControlMaster=auto",
+      "-o", "ControlPath=" + control,
+      "-o", "ControlPersist=300"
+    )
+  }
+  // `--` ends option parsing: belt and braces beside hostIsValid above.
+  command.push("--", String(host), quote(cliPath))
   for (var i = 0; i < args.length; i++) command.push(quote(args[i]))
   return command
 }
+
+// ------------------------------------------------------------------ limits
+//
+// Ceilings on remote-derived data. The transport already caps raw bytes (see
+// Service.qml), but a reply can be under that ceiling and still absurd — a
+// million-element array, a megabyte-long accessory name — and everything past
+// these limits would only be UI-thread work on data no real home produces.
+// HomeKit itself tops out in the low hundreds of accessories per home.
+var MAX_ACCESSORIES = 1024
+var MAX_SCENES = 512
+var MAX_READINGS = 12
+var MAX_SCENE_ROOMS = 32
+var MAX_TEXT = 512
 
 // -------------------------------------------------------------- display
 //
@@ -74,6 +94,9 @@ function sshArgs(host, cliPath, args, controlPath) {
 // address accessories and scenes by UUID.
 function displayText(value) {
   var text = String(value === undefined || value === null ? "" : value)
+  // Labels are one line of a panel; nothing legitimate needs more than this,
+  // and an unbounded remote string would otherwise be walked and rendered.
+  if (text.length > MAX_TEXT) text = text.substring(0, MAX_TEXT)
   var out = ""
   for (var i = 0; i < text.length; i++) {
     var code = text.charCodeAt(i)
@@ -162,6 +185,7 @@ function readingsOf(state) {
   var out = []
   if (!state || typeof state !== "object") return out
   for (var key in state) {
+    if (out.length >= MAX_READINGS) break
     if (!Object.prototype.hasOwnProperty.call(state, key)) continue
     if (key === "power" || key === "brightness" || key === "color_temperature") continue
     var raw = state[key]
@@ -264,7 +288,10 @@ function buildRooms(items, hiddenRooms, overrides) {
 
   var byRoom = Object.create(null)
   var list = items && items.length !== undefined ? items : []
-  for (var i = 0; i < list.length; i++) {
+  // Bounded walk: `length` came off the wire too, and a huge-but-valid array
+  // must not become a hundred thousand delegate rows.
+  var itemLimit = Math.min(Number(list.length) || 0, MAX_ACCESSORIES)
+  for (var i = 0; i < itemLimit; i++) {
     var item = list[i]
     // A row that is not an object at all (a bare string from a schema change)
     // has nothing to render; skip it rather than throwing the whole refresh.
@@ -316,7 +343,12 @@ function buildScenes(items) {
   var list = items && items.length !== undefined ? items : []
   var out = []
   var homeName = ""
-  for (var i = 0; i < list.length; i++) {
+  // `sceneLimit`, not `count`: `var` is function-scoped and the loop body
+  // below already has a `count` for each scene's action_count — reusing the
+  // name silently turned the loop bound into whatever the last scene's action
+  // count was.
+  var sceneLimit = Math.min(Number(list.length) || 0, MAX_SCENES)
+  for (var i = 0; i < sceneLimit; i++) {
     var scene = list[i]
     if (!scene || typeof scene !== "object") continue
     if (homeName === "" && scene.home_name) homeName = String(scene.home_name)
@@ -333,7 +365,8 @@ function buildScenes(items) {
     // meaning; anything else is no rooms at all.
     var rooms = []
     if (Array.isArray(scene.rooms)) {
-      for (var r = 0; r < scene.rooms.length; r++) rooms.push(String(scene.rooms[r]))
+      var roomCount = Math.min(scene.rooms.length, MAX_SCENE_ROOMS)
+      for (var r = 0; r < roomCount; r++) rooms.push(String(scene.rooms[r]))
     } else if (typeof scene.rooms === "string" && scene.rooms !== "") {
       rooms.push(scene.rooms)
     }

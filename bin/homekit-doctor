@@ -24,17 +24,36 @@ SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
 PLUGIN_ID="ca.orospakr.homekit"
 DEFAULT_CLI_PATH="/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli"
 
+# Producer-side ceilings, in bytes, on captured remote output — enforced on
+# this side with `head -c`, so a hostile or wedged endpoint gets truncated
+# rather than buffered into a shell variable without limit. The stdout ceiling
+# matches the widget's (Service.qml); a real `list --json` is tens of KB.
+REMOTE_STDOUT_LIMIT=$((4 * 1024 * 1024))
+REMOTE_STDERR_LIMIT=$((256 * 1024))
+
 # Keep this list in sync with Model.sshArgs() in Model.js. It is copied verbatim
 # rather than trimmed so the doctor exercises the exact transport the widget
-# uses — including the shared control socket, which means a successful run also
-# leaves a warm master connection behind for the panel.
+# uses — including the control socket, which means a successful run also leaves
+# a warm master connection behind for the panel.
 ssh_opts=(
   -o BatchMode=yes
   -o ConnectTimeout=5
-  -o ControlMaster=auto
-  -o "ControlPath=${XDG_RUNTIME_DIR:-/tmp}/homekit-ssh-%C"
-  -o ControlPersist=300
 )
+
+# Multiplexing goes through the per-user runtime directory or not at all,
+# exactly as the widget decides it (Service.qml trusts XDG_RUNTIME_DIR's
+# spec-guaranteed 0700 mode; bash can actually verify ownership and mode, so
+# it does). Without a validated owner-only directory there is no ControlMaster
+# — the old fallback was shared /tmp, a predictable path another local user
+# could claim first — and every call simply pays its own handshake.
+if [[ -n ${XDG_RUNTIME_DIR:-} && -d ${XDG_RUNTIME_DIR:-} && -O ${XDG_RUNTIME_DIR:-} ]] &&
+   [[ $(stat -c %a -- "${XDG_RUNTIME_DIR}" 2>/dev/null) == 700 ]]; then
+  ssh_opts+=(
+    -o ControlMaster=auto
+    -o "ControlPath=${XDG_RUNTIME_DIR}/homekit-ssh-%C"
+    -o ControlPersist=300
+  )
+fi
 
 # ----------------------------------------------------------------- output
 
@@ -159,18 +178,18 @@ rquote() {
 }
 
 # A stuck auth exchange would otherwise sit here forever; ConnectTimeout only
-# covers reaching the port.
+# covers reaching the port. TERM at 25 s with a KILL 5 s later for an ssh that
+# ignores it — the same two-stage reaping the widget's own watchdog performs.
+# `timeout` is a hard requirement, checked before the first remote call: the
+# old fallback of running ssh with no deadline at all meant a wedged remote
+# could hang the whole run indefinitely.
 #
 # The `--` is the same one Model.sshArgs() emits: ssh parses a leading '-' on
 # the destination as one of its own options even though it is a separate argv
 # element, and -oProxyCommand=… would then run a command on THIS machine. Step 1
 # refuses such a host outright; this is the belt to that suspenders.
 run_ssh() {
-  if have timeout; then
-    timeout 25 ssh "${ssh_opts[@]}" -- "$@"
-  else
-    ssh "${ssh_opts[@]}" -- "$@"
-  fi
+  timeout -k 5 25 ssh "${ssh_opts[@]}" -- "$@"
 }
 
 # Bash arithmetic recursively evaluates the *contents* of a variable, command
@@ -476,6 +495,14 @@ printf '%shomekit-doctor%s  host=%s  cliPath=%s%s\n\n' \
   "$BOLD" "$RESET" "$(clean "${host:-<unset>}")" "$(clean "$cli_path")" \
   "$([[ $from_config -eq 1 ]] && printf '  (from shell.json)')"
 
+# Fail closed before anything remote: every ssh below runs under `timeout`
+# with a KILL grace, and without the tool there would be no deadline at all.
+have timeout || die "coreutils 'timeout' is not installed here" \
+  "Every remote call this script makes runs under a hard deadline, and with no" \
+  "timeout facility a wedged connection would hang this run forever. It ships" \
+  "in coreutils, so its absence is unusual:" \
+  "  sudo pacman -S coreutils"
+
 # ---------------------------------------------------- 1. host is configured
 
 if [[ -z $host ]]; then
@@ -576,7 +603,10 @@ fi
 
 # ------------------------------------------------------------- 3. ssh works
 
-ssh_err=$(run_ssh "$host" true 2>&1 >/dev/null)
+# Bounded capture: ssh's own diagnostics are short, so anything past the
+# ceiling is not worth keeping. With pipefail set, ssh's failure survives the
+# pipe (head exits 0), so $? is still ssh's exit status when it fails.
+ssh_err=$(run_ssh "$host" true 2>&1 >/dev/null | head -c "$REMOTE_STDERR_LIMIT")
 ssh_rc=$?
 ssh_lower=$(printf '%s' "$ssh_err" | tr '[:upper:]' '[:lower:]')
 
@@ -649,11 +679,15 @@ ok "SSH to $host works" "Key-based, non-interactive, under the widget's own opti
 if ! run_ssh "$host" test -x "$(rquote "$cli_path")" >/dev/null 2>&1; then
   # Best-effort: ask Spotlight where the bundle actually landed. The bundle id
   # is com.shahine.homeclaw, so the match has to be case-insensitive ("c").
+  # head -c before head -n: one line is wanted, but a single line with no
+  # newline in it would otherwise be captured without a byte ceiling.
   found=$(run_ssh "$host" \
-    'mdfind' "$(rquote 'kMDItemCFBundleIdentifier == "*HomeClaw*"c')" 2>/dev/null | head -n 1)
+    'mdfind' "$(rquote 'kMDItemCFBundleIdentifier == "*HomeClaw*"c')" 2>/dev/null |
+    head -c 4096 | head -n 1)
   if [[ -z $found ]]; then
     found=$(run_ssh "$host" \
-      'mdfind' "$(rquote 'kMDItemFSName == "HomeClaw.app"')" 2>/dev/null | head -n 1)
+      'mdfind' "$(rquote 'kMDItemFSName == "HomeClaw.app"')" 2>/dev/null |
+      head -c 4096 | head -n 1)
   fi
 
   if [[ -n $found ]]; then
@@ -687,10 +721,16 @@ trap 'rm -f "$err_file"' EXIT
 # One read, run exactly as the widget runs it, with stdout, stderr and exit
 # status kept apart: a transport failure, a CLI refusal and a well-formed reply
 # of the wrong shape each need a different remedy.
+#
+# Both captures are bounded on this side. With pipefail set, a genuine ssh/CLI
+# failure survives the pipe into $?; an endpoint that overruns the stdout
+# ceiling has ssh cut off mid-stream (SIGPIPE), which reads as the transport
+# failure it is. Stderr is bounded when it is read back out of the file.
 capture() {
-  cap_out=$(run_ssh "$host" "$(rquote "$cli_path")" "$@" 2>"$err_file")
+  cap_out=$(run_ssh "$host" "$(rquote "$cli_path")" "$@" 2>"$err_file" |
+    head -c "$REMOTE_STDOUT_LIMIT")
   cap_rc=$?
-  cap_err=$(cat "$err_file")
+  cap_err=$(head -c "$REMOTE_STDERR_LIMIT" "$err_file")
 }
 
 capture 'status' '--json'

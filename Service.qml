@@ -47,9 +47,16 @@ Item {
     "A host is a plain name, an ~/.ssh/config alias, or user@name — no leading dash, "
     + "no spaces. Set it with: omarchy bar set ca.orospakr.homekit host <your-mac>"
 
-  // Per-user runtime dir keeps the control socket out of shared /tmp. %C is
-  // ssh's hash of host/port/user, so several hosts never collide.
-  readonly property string controlPath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/homekit-ssh-%C"
+  // The control socket lives only in the per-user runtime directory (0700 by
+  // the XDG spec). No XDG_RUNTIME_DIR means no acceptable place for it — the
+  // old fallback was shared /tmp, a predictable path another local user could
+  // claim first — so the empty string tells Model.sshArgs to skip multiplexing
+  // entirely: slower, never a shared socket. %C is ssh's hash of
+  // host/port/user, so several hosts never collide.
+  readonly property string controlPath: {
+    var dir = Quickshell.env("XDG_RUNTIME_DIR")
+    return dir ? dir + "/homekit-ssh-%C" : ""
+  }
 
   // ---------------------------------------------------------------- state
   property var rawAccessories: []
@@ -161,11 +168,21 @@ Item {
       property alias command: proc.command
       property alias running: proc.running
 
-      // The single place a callback is allowed to run, so the watchdog and a
-      // real exit can race without the caller's bookkeeping running twice.
+      // Producer-side ceilings on what the far side may stream back. A healthy
+      // `list --json` is tens of kilobytes; a compromised or wedged endpoint
+      // used to be able to stream until this process exhausted memory, because
+      // the collectors buffered without limit. Counted in UTF-16 units, which
+      // is exact for ASCII JSON and never undercounts bytes by more than 2x.
+      readonly property int stdoutLimit: 4 * 1024 * 1024
+      readonly property int stderrLimit: 256 * 1024
+
+      // The single place a callback is allowed to run, so the watchdog, an
+      // overflow and a real exit can race without the caller's bookkeeping
+      // running twice.
       function finish(exitCode, out, err) {
         if (job.finished) return
         job.finished = true
+        root.activeJobs = Math.max(0, root.activeJobs - 1)
         var cb = job.callback
         job.callback = null
         if (!cb) return
@@ -178,11 +195,26 @@ Item {
         }
       }
 
+      // The collectors update `text` as data arrives (waitForEnd off) so the
+      // ceiling is enforced while the remote is still streaming — the job is
+      // terminated at the limit, not after buffering whatever the peer felt
+      // like sending. At a normal exit the stream has ended before onExited
+      // fires, so `text` is complete exactly as it was under waitForEnd.
+      function enforceCeiling() {
+        if (job.finished) return
+        if (jobOut.text.length <= job.stdoutLimit && jobErr.text.length <= job.stderrLimit) return
+        console.warn("ca.orospakr.homekit: remote output exceeded the size ceiling, terminating:",
+                     String(proc.command))
+        job.finish(-1, "", "the remote endpoint sent more output than this widget will read")
+        proc.running = false
+        hardKill.restart()
+      }
+
       Process {
         id: proc
         running: false
-        stdout: StdioCollector { id: jobOut; waitForEnd: true }
-        stderr: StdioCollector { id: jobErr; waitForEnd: true }
+        stdout: StdioCollector { id: jobOut; waitForEnd: false; onTextChanged: job.enforceCeiling() }
+        stderr: StdioCollector { id: jobErr; waitForEnd: false; onTextChanged: job.enforceCeiling() }
         onStarted: job.launched = true
         onExited: function(exitCode, exitStatus) {
           try {
@@ -225,12 +257,6 @@ Item {
       // stuck in an uninterruptible wait can sit on indefinitely. The caller's
       // bookkeeping was already released by the watchdog, so without this the
       // deadline is advisory and the child, its Process and this Item leak.
-      //
-      // Trade-off accepted deliberately: there is still no global cap on
-      // concurrent jobs, so an IPC caller naming distinct UUIDs (which bypasses
-      // the per-accessory busy check) can pile up ssh processes for up to 33 s
-      // before this reaps them — the cost of never making a read queue behind
-      // an unrelated write.
       Timer {
         id: hardKill
         interval: 3000
@@ -243,11 +269,27 @@ Item {
     }
   }
 
+  // Global ceiling on live ssh processes. The per-accessory busy check stops
+  // double writes, but the IPC routes accept any UUID-shaped token — that is
+  // deliberate, a UUID can only ever mean one accessory — so a local caller
+  // inventing distinct UUIDs could otherwise pile up an unbounded number of
+  // concurrent jobs, each alive for up to 33 s. Six covers the panel's worst
+  // honest moment (a refresh's two reads, a couple of writes, a settle read)
+  // with headroom; excess work is refused with a reason rather than queued,
+  // and the caller retries when something finishes.
+  readonly property int maxConcurrentJobs: 6
+  property int activeJobs: 0
+
   function runJob(args, callback) {
     var command = Model.sshArgs(root.sshHost, root.cliPath, args, root.controlPath)
     if (!command) {
       console.warn("ca.orospakr.homekit: refusing to run ssh for an unusable host")
       if (callback) callback(-1, "", "invalid host")
+      return null
+    }
+    if (root.activeJobs >= root.maxConcurrentJobs) {
+      console.warn("ca.orospakr.homekit: refusing ssh job,", root.activeJobs, "already running")
+      if (callback) callback(-1, "", "too many HomeKit calls at once; try again in a moment")
       return null
     }
     var job = jobComponent.createObject(root, { command: command })
@@ -256,6 +298,7 @@ Item {
       if (callback) callback(-1, "", "could not start ssh")
       return null
     }
+    root.activeJobs += 1
     job.callback = callback
     job.running = true
     return job
