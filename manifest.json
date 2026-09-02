@@ -3,7 +3,7 @@
   "id": "ca.orospakr.homekit",
   "name": "HomeKit",
   "version": "1.0.0",
-  "author": "andrew",
+  "author": "Andrew Clunis",
   "description": "Control Apple HomeKit lights, outlets, and scenes through the HomeClaw CLI running on a Mac over SSH",
   "kinds": [
     "bar-widget"
