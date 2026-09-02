@@ -8,8 +8,8 @@
 
 // ssh does NOT forward its remote argv as a vector: it joins the arguments
 // after the hostname with single spaces and hands the resulting string to the
-// login shell on the far side. Every HomeKit accessory name in this house has
-// a space in it ("Black Lamp", "Lea's Standing Lamp"), so each remote-side
+// login shell on the far side. Nearly every HomeKit accessory name has a
+// space in it ("Desk Lamp", "Kid's Standing Lamp"), so each remote-side
 // word must arrive already quoted FOR THAT SHELL or it would arrive as two
 // arguments. POSIX single-quote escaping: close, backslash-escaped quote,
 // reopen — which is also why an apostrophe in a HomeKit name is safe.
@@ -645,7 +645,7 @@ function authRemedy() {
 
 function cliRemedy(cliPath) {
   return "homeclaw-cli not found at " + cliPath
-       + ". Set cliPath: omarchy bar set andrew.homekit cliPath <path>"
+       + ". Set cliPath: omarchy bar set ca.orospakr.homekit cliPath <path>"
 }
 
 function appRemedy(host) {

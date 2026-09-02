@@ -1,14 +1,39 @@
-# andrew.homekit
+# HomeKit for Omarchy
 
-An Omarchy (QuickShell) bar widget that controls Apple HomeKit accessories and
-scenes by invoking [HomeClaw](https://github.com/omarshahine/HomeClaw)'s CLI on
-a Mac over SSH.
+**Apple Home, in your Omarchy bar.** Flip lights, dim lamps, and run scenes
+from a fast, keyboard-friendly panel — on Linux, where HomeKit doesn't
+officially exist.
 
-HomeKit has no public Linux API. HomeClaw is a Mac app that holds the HomeKit
-permission and ships `homeclaw-cli`; this widget is a thin, well-behaved client
-for it. Nothing is installed on the Mac by this plugin — HomeClaw.app just has
-to be running there, and SSH from this machine has to work key-based. In
-exchange you get a Linux bar pill that turns the lights off.
+![The panel open, showing scenes and rooms of accessories](preview.png)
+
+- **Scenes are one click away** — every runnable scene, right at the top.
+- **Every room, every accessory** — on/off toggles, a dimmer under each light
+  that reports brightness, sensor readings inline.
+- **Keyboard all the way down** — arrows to move, `⏎` to toggle, `←`/`→` to
+  dim.
+- **Bindable from Hyprland** — IPC routes trigger scenes and set power or
+  brightness without the panel ever opening:
+  `omarchy-shell ca.orospakr.homekit scene "Good Night"`.
+- **Kind when it breaks** — every error names the broken link in the chain and
+  the fix for it, and the bundled `bin/homekit-doctor` walks the whole chain
+  for you.
+
+## How it works
+
+HomeKit has no API a Linux machine can call. This widget borrows a Mac's:
+[HomeClaw](https://github.com/omarshahine/HomeClaw) is a Mac app that holds
+the HomeKit permission and ships `homeclaw-cli`, and the widget is a thin,
+careful client for that CLI over key-based SSH. (HomeClaw was written as an
+OpenClaw integration, but no AI agent is involved — the widget simply uses it
+as a HomeKit gateway.)
+
+Three things make it go: a Mac that stays awake with HomeClaw running,
+key-based SSH to that Mac, and a name for it that resolves from your Linux
+box — a Tailscale MagicDNS name being the kind that keeps working when you
+leave the house. The [Setup](#setup) section walks through all three.
+
+Plugin id: `ca.orospakr.homekit`. Requires Omarchy's plugin system (Quattro,
+4.x). MIT licensed.
 
 ## For AI agents
 
@@ -27,16 +52,16 @@ Checklist:
 2. Remote Login on in System Settings → General → Sharing.
 3. This machine's public key in `~/.ssh/authorized_keys` on the Mac.
 4. The Mac reachable by name (Tailscale MagicDNS, or a `~/.ssh/config` alias).
-5. `omarchy bar set andrew.homekit host <name>`.
+5. `omarchy bar set ca.orospakr.homekit host <name>`.
 
 Then **run `bin/homekit-doctor` and act on the first failing step.** It walks
 that chain in order, stops at the first break, and prints the exact command or
-setting that fixes *that* link. Do not guess from the panel's error text when
+setting that fixes _that_ link. Do not guess from the panel's error text when
 the doctor will name the link.
 
 ```bash
-~/.config/omarchy/plugins/andrew.homekit/bin/homekit-doctor            # uses the widget's own settings
-~/.config/omarchy/plugins/andrew.homekit/bin/homekit-doctor my-mac    # or check a host directly
+~/.config/omarchy/plugins/ca.orospakr.homekit/bin/homekit-doctor           # uses the widget's own settings
+~/.config/omarchy/plugins/ca.orospakr.homekit/bin/homekit-doctor my-mac    # or check a host directly
 ```
 
 It only ever runs read-only HomeClaw subcommands — `status`, `list` and
@@ -55,11 +80,35 @@ own calls succeeded, not merely that ssh works.
 - **Panel** — the home name and connection status, every scene as a one-click
   row, then every accessory grouped by room: an optimistic on/off toggle per
   controllable accessory and a 0–100 dimmer under every light that reports
-  brightness. Sensors render read-only. Unreachable accessories are dimmed and
-  inert, as are HomeKit's stock Arrive/Leave/Wake scenes while they still have
-  no actions in them (the CLI refuses to trigger those).
+  brightness. Sensor readings render inline. Unreachable accessories are
+  dimmed and inert, as are HomeKit's stock Arrive/Leave/Wake scenes while they
+  still have no actions in them (the CLI refuses to trigger those).
 - **Keyboard** — `↑`/`↓` move the cursor, `⏎` toggles, `←`/`→` nudge brightness
   by 10, `R` refreshes, `Esc` closes, `Tab` switches panels.
+- **IPC** — trigger scenes and set power or brightness from a Hyprland bind,
+  no panel open. See [IPC](#ipc).
+
+## Not supported (yet)
+
+- **Color.** No hue or saturation control, and while the CLI reports
+  `color_temperature`, the widget neither shows nor writes it. The dimmer is
+  brightness only.
+- **Cameras.** No snapshots, no streams. A camera appears as an inert row at
+  most.
+- **Thermostats, locks, blinds, garage doors.** Only lightbulbs, outlets,
+  switches, and fans get a toggle; every other category renders read-only.
+  (A lock that a stray IPC call cannot open is arguably a feature, but
+  thermostat setpoints would be genuinely useful.)
+- **Automations.** HomeKit automations are not scenes; the panel lists and
+  triggers scenes only.
+- **Multiple homes.** One home is assumed — the panel shows a single home name
+  and does not group accessories by home.
+- **Editing the home.** No pairing, renaming, or room assignment. That stays
+  in Apple's Home app.
+
+Sensors are read-only by design and already work: temperature, humidity, air
+quality, battery, contact, motion, and position readings render under the
+accessory that reports them. There is just nothing there to click.
 
 ## Setup
 
@@ -87,6 +136,7 @@ stays awake.
 
   If sshd ignores the file, the permissions are usually why:
   `chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys`.
+
 - **Stop it sleeping.** System Settings → Energy (desktop) or Battery → Options
   (laptop): prevent automatic sleeping, or at minimum enable wake for network
   access. A sleeping Mac is indistinguishable from an absent one.
@@ -112,7 +162,7 @@ Host homekit-mac
 ```
 
 ```bash
-omarchy bar set andrew.homekit host homekit-mac
+omarchy bar set ca.orospakr.homekit host homekit-mac
 ```
 
 Now the user, port, key, and address can all change without touching the
@@ -133,17 +183,15 @@ omarchy plugin add https://github.com/orospakr/omarchy-homekit.git --enable
 
 `omarchy plugin add` clones the repo, validates its `manifest.json` against the
 schema the shell enforces, moves it to `~/.config/omarchy/plugins/<id>` (here
-`andrew.homekit`, taken from the manifest — not from the repo name), and offers
-to enable it and pick a bar section. It clones non-interactively, so a private
-repo needs a URL your ssh agent can authenticate:
-`omarchy plugin add git@github.com:orospakr/omarchy-homekit.git`.
+`ca.orospakr.homekit`, taken from the manifest — not from the repo name), and
+offers to enable it and pick a bar section.
 
 By hand instead:
 
 ```bash
 git clone https://github.com/orospakr/omarchy-homekit.git \
-  ~/.config/omarchy/plugins/andrew.homekit
-omarchy plugin enable andrew.homekit --section right
+  ~/.config/omarchy/plugins/ca.orospakr.homekit
+omarchy plugin enable ca.orospakr.homekit --section right
 omarchy-restart-shell
 ```
 
@@ -157,11 +205,10 @@ systemctl --user show-environment | grep SSH_AUTH_SOCK
 ```
 
 If that prints nothing, whatever starts your agent is not exporting it where
-the shell can see it. Two shapes both work — the agent this machine uses is
-started from Hyprland's autostart at a fixed socket path, with the matching
-`env = SSH_AUTH_SOCK,$XDG_RUNTIME_DIR/ssh-agent.socket` (in
-`~/.config/hypr/envs.conf`, or `hl.env(...)` in `autostart.lua`) so everything
-Hyprland launches inherits it:
+the shell can see it. Two shapes both work. The first starts the agent from
+Hyprland's autostart at a fixed socket path, with a matching `env` line so
+everything Hyprland launches inherits it (in `~/.config/hypr/envs.conf`, or
+`hl.env(...)` in `autostart.lua`):
 
 ```
 env = SSH_AUTH_SOCK,$XDG_RUNTIME_DIR/ssh-agent.socket
@@ -178,14 +225,27 @@ systemctl --user import-environment SSH_AUTH_SOCK
 **Point it at the Mac.**
 
 ```bash
-omarchy bar set andrew.homekit host homekit-mac
-omarchy bar set andrew.homekit cliPath /Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli   # only if HomeClaw lives elsewhere
+omarchy bar set ca.orospakr.homekit host homekit-mac
+omarchy bar set ca.orospakr.homekit cliPath /Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli   # only if HomeClaw lives elsewhere
 ```
+
+**Removal.**
+
+```bash
+omarchy plugin remove ca.orospakr.homekit
+```
+
+That disables the widget and deletes
+`~/.config/omarchy/plugins/ca.orospakr.homekit`. The plugin keeps no other state
+on this machine — the one thing it leaves behind is the multiplexed ssh
+control socket in `$XDG_RUNTIME_DIR`, which expires on its own within five
+minutes (`ControlPersist=300`). Nothing on the Mac was installed by the
+widget, so there is nothing to undo there.
 
 ### 4. Verify
 
 ```bash
-~/.config/omarchy/plugins/andrew.homekit/bin/homekit-doctor
+~/.config/omarchy/plugins/ca.orospakr.homekit/bin/homekit-doctor
 ```
 
 A healthy run ends like this:
@@ -208,7 +268,7 @@ exits zero and answers with a JSON array. A `status` that works while `list`
 fails is exactly how the panel breaks, so the doctor is not allowed to pass on
 `status` alone.
 
-That check needs a real JSON parser on *this* machine — `jq`, or `python3` as
+That check needs a real JSON parser on _this_ machine — `jq`, or `python3` as
 the fallback. With neither installed the doctor stops at that step and says so
 rather than eyeballing the reply with a regex: "starts with a `[`" is not the
 same as "is a JSON array", and a run that cannot verify the replies is not
@@ -227,17 +287,17 @@ stripped of terminal escape sequences before it is printed.
 The panel prints the remedy, not just the symptom; `Model.classifyFailure`
 picks which one. Every kind below maps to a doctor step.
 
-| Panel says | Kind | Cause | Fix |
-| --- | --- | --- | --- |
-| *Point this at a Mac running HomeClaw* (setup card) | — | `host` is unset; nothing has been attempted | `omarchy bar set andrew.homekit host <your-mac>` (doctor step 1) |
-| `Cannot resolve <host>` | `ssh` | The name means nothing here — typo, MagicDNS off, missing `.local`, or no `~/.ssh/config` entry | Fix the name or add the alias; `tailscale status` to confirm the peer (doctor step 3) |
-| `<host> is not answering` | `ssh` | Resolves but no reply: Mac asleep, off the network, off-LAN without Tailscale, or Remote Login off (connection refused) | Wake it, check Energy settings, turn on Remote Login (doctor step 3) |
-| `SSH key rejected by <host>` | `ssh` | The Mac does not trust the offered key, or the shell has no agent, or the username is wrong | `ssh-copy-id <host>`; check `SSH_AUTH_SOCK` in the shell's environment; set `User` in `~/.ssh/config` (doctor steps 2–3) |
-| `SSH to <host> failed: …` | `ssh` | Anything else from ssh — commonly a changed host key after a reinstall | Read the quoted line; `ssh-keygen -R <host>` then `ssh <host> true` once by hand (doctor step 3) |
-| `homeclaw-cli not found on <host>` | `cli-missing` | Wrong `cliPath`, or HomeClaw is not installed. A bare name never works: non-interactive sshd on macOS has a PATH without `/opt/homebrew/bin` | The doctor asks Spotlight where the bundle is and prints the `omarchy bar set … cliPath` line to run (doctor step 4) |
-| `HomeClaw is not responding on <host>` | `app` | The binary ran but the app is not up, or is up with no home: not launched, still loading, or HomeKit access never granted | Open HomeClaw.app, enable launch-at-login, check System Settings → Privacy & Security → HomeKit (doctor step 5) |
-| Any other one-line message | `cli` | `homeclaw-cli` itself refused — exit 64: unknown accessory name, bad value, a scene with no actions | Take it literally; names must match `list`/`scenes` exactly, spaces and all |
-| Panel connects but is empty | — | HomeClaw reports zero homes, or every room is in `hiddenRooms` | Check the Mac is signed in to the iCloud account that owns the home; check `hiddenRooms` |
+| Panel says                                          | Kind          | Cause                                                                                                                                        | Fix                                                                                                                      |
+| --------------------------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| _Point this at a Mac running HomeClaw_ (setup card) | —             | `host` is unset; nothing has been attempted                                                                                                  | `omarchy bar set ca.orospakr.homekit host <your-mac>` (doctor step 1)                                                       |
+| `Cannot resolve <host>`                             | `ssh`         | The name means nothing here — typo, MagicDNS off, missing `.local`, or no `~/.ssh/config` entry                                              | Fix the name or add the alias; `tailscale status` to confirm the peer (doctor step 3)                                    |
+| `<host> is not answering`                           | `ssh`         | Resolves but no reply: Mac asleep, off the network, off-LAN without Tailscale, or Remote Login off (connection refused)                      | Wake it, check Energy settings, turn on Remote Login (doctor step 3)                                                     |
+| `SSH key rejected by <host>`                        | `ssh`         | The Mac does not trust the offered key, or the shell has no agent, or the username is wrong                                                  | `ssh-copy-id <host>`; check `SSH_AUTH_SOCK` in the shell's environment; set `User` in `~/.ssh/config` (doctor steps 2–3) |
+| `SSH to <host> failed: …`                           | `ssh`         | Anything else from ssh — commonly a changed host key after a reinstall                                                                       | Read the quoted line; `ssh-keygen -R <host>` then `ssh <host> true` once by hand (doctor step 3)                         |
+| `homeclaw-cli not found on <host>`                  | `cli-missing` | Wrong `cliPath`, or HomeClaw is not installed. A bare name never works: non-interactive sshd on macOS has a PATH without `/opt/homebrew/bin` | The doctor asks Spotlight where the bundle is and prints the `omarchy bar set … cliPath` line to run (doctor step 4)     |
+| `HomeClaw is not responding on <host>`              | `app`         | The binary ran but the app is not up, or is up with no home: not launched, still loading, or HomeKit access never granted                    | Open HomeClaw.app, enable launch-at-login, check System Settings → Privacy & Security → HomeKit (doctor step 5)          |
+| Any other one-line message                          | `cli`         | `homeclaw-cli` itself refused — exit 64: unknown accessory name, bad value, a scene with no actions                                          | Take it literally; names must match `list`/`scenes` exactly, spaces and all                                              |
+| Panel connects but is empty                         | —             | HomeClaw reports zero homes, or every room is in `hiddenRooms`                                                                               | Check the Mac is signed in to the iCloud account that owns the home; check `hiddenRooms`                                 |
 
 ## IPC
 
@@ -245,11 +305,11 @@ Beyond the usual `open`/`close`/`toggle`/`refresh`, the panel exposes write
 routes so a Hyprland bind can act without opening anything.
 
 ```
-omarchy-shell andrew.homekit scene "Good Night"
-omarchy-shell andrew.homekit power "Desk Lamp" off
-omarchy-shell andrew.homekit power "Desk Lamp" toggle
-omarchy-shell andrew.homekit power 8B1D0F42-0C1A-4E7E-9B0E-6E8B7A2C51D3 on
-omarchy-shell andrew.homekit brightness "Desk Lamp" 40
+omarchy-shell ca.orospakr.homekit scene "Good Night"
+omarchy-shell ca.orospakr.homekit power "Desk Lamp" off
+omarchy-shell ca.orospakr.homekit power "Desk Lamp" toggle
+omarchy-shell ca.orospakr.homekit power 8B1D0F42-0C1A-4E7E-9B0E-6E8B7A2C51D3 on
+omarchy-shell ca.orospakr.homekit brightness "Desk Lamp" 40
 ```
 
 **Naming.** The first argument is either a HomeKit UUID — the `id` field of
@@ -285,16 +345,16 @@ lock on anything — the lock is the login session and the key in it.
 
 ## Settings
 
-Set with `omarchy bar set andrew.homekit <key> <value>`.
+Set with `omarchy bar set ca.orospakr.homekit <key> <value>`.
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `host` | *(unset)* | SSH host — a hostname, IP, Tailscale MagicDNS name, or `~/.ssh/config` alias. **Required.** While it is empty the panel shows a first-run setup card (the four steps above, plus a pointer at `bin/homekit-doctor`) in place of the accessory list, and the bar pill stays neutral rather than reading as an error |
-| `cliPath` | `/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli` | Absolute path to the CLI on that host |
-| `icon` | `󰋜` | Bar glyph |
-| `pollSeconds` | `10` | Refresh interval **while the panel is open** (3–120) |
-| `scrollSpeed` | `4.0` | Trackpad scroll speed factor for the accessory list |
-| `hiddenRooms` | `[]` | Rooms to leave out of the panel |
+| Key           | Default                                                  | Meaning                                                                                                                                                                                                                                                                                                            |
+| ------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `host`        | _(unset)_                                                | SSH host — a hostname, IP, Tailscale MagicDNS name, or `~/.ssh/config` alias. **Required.** While it is empty the panel shows a first-run setup card (the four steps above, plus a pointer at `bin/homekit-doctor`) in place of the accessory list, and the bar pill stays neutral rather than reading as an error |
+| `cliPath`     | `/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli` | Absolute path to the CLI on that host                                                                                                                                                                                                                                                                              |
+| `icon`        | `󰋜`                                                      | Bar glyph                                                                                                                                                                                                                                                                                                          |
+| `pollSeconds` | `10`                                                     | Refresh interval **while the panel is open** (3–120)                                                                                                                                                                                                                                                               |
+| `scrollSpeed` | `4.0`                                                    | Trackpad scroll speed factor for the accessory list                                                                                                                                                                                                                                                                |
+| `hiddenRooms` | `[]`                                                     | Rooms to leave out of the panel                                                                                                                                                                                                                                                                                    |
 
 ## Design notes
 
@@ -311,16 +371,16 @@ a setting rather than a lookup.
 
 **Remote quoting.** `ssh` does not forward a remote argv vector: it joins the
 arguments after the hostname with spaces and hands the string to the login
-shell on the far side. Every accessory name here has a space in it, so
-`Model.quote()` pre-quotes each remote word for *that* shell (with proper
-`'\''` escaping, which is also what makes `Lea's Standing Lamp` safe). Nothing
+shell on the far side. Nearly every HomeKit accessory name has a space in it,
+so `Model.quote()` pre-quotes each remote word for _that_ shell (with proper
+`'\''` escaping, which is also what makes `Kid's Standing Lamp` safe). Nothing
 is ever passed through a shell on this side — `Process.command` is always an
 argv array. `bin/homekit-doctor` repeats the same trick in bash, for the same
 reason.
 
 The destination itself is the one thing that cannot be quoted out of trouble:
 `ssh` reads a leading `-` as one of its own options even when the host arrives
-as a separate argv element, and `-oProxyCommand=…` runs a command on *this*
+as a separate argv element, and `-oProxyCommand=…` runs a command on _this_
 machine. So both command builders put `--` before the host, and both refuse a
 `host` that starts with a dash or carries whitespace or control characters —
 no real destination looks like that, and a settings file is not a trusted
@@ -361,3 +421,14 @@ Mac asleep), a missing CLI (exit 127), and HomeClaw itself not answering its
 local socket. Each remedy names the next concrete thing to do — the exact
 command, the exact file — because the person reading it is usually setting this
 up for the first time and has no idea which half of the chain just failed.
+
+## License and dependencies
+
+MIT — see [LICENSE](LICENSE).
+
+On the Mac: [HomeClaw](https://github.com/omarshahine/HomeClaw), a third-party
+app from the Mac App Store (not affiliated with this plugin), holding the
+HomeKit permission. On the Omarchy machine: the OpenSSH client, which is
+already everywhere, and — only for `bin/homekit-doctor`'s JSON verification
+step — `jq` or `python3`. The widget itself needs nothing beyond what the
+Omarchy shell provides.

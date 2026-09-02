@@ -21,7 +21,7 @@
 set -uo pipefail
 
 SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
-PLUGIN_ID="andrew.homekit"
+PLUGIN_ID="ca.orospakr.homekit"
 DEFAULT_CLI_PATH="/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli"
 
 # Keep this list in sync with Model.sshArgs() in Model.js. It is copied verbatim

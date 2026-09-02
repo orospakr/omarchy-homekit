@@ -8,7 +8,7 @@ import qs.Ui
 // call is forwarded down into the lazily loaded Panel.qml.
 BarWidget {
   id: root
-  moduleName: "andrew.homekit"
+  moduleName: "ca.orospakr.homekit"
 
   function injectPanel() {
     var target = panelLoader.item

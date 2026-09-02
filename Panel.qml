@@ -14,8 +14,8 @@ import "Model.js" as Model
 // fresh read lands underneath.
 Panel {
   id: root
-  moduleName: "andrew.homekit"
-  ipcTarget: "andrew.homekit"
+  moduleName: "ca.orospakr.homekit"
+  ipcTarget: "ca.orospakr.homekit"
   manageIpc: false
 
   property var anchorItem: null
@@ -164,7 +164,7 @@ Panel {
 
   // ------------------------------------------------------------- ipc plumbing
   function ipcReject(message) {
-    console.warn("andrew.homekit: " + message)
+    console.warn("ca.orospakr.homekit: " + message)
     svc.flashStatus(message)
   }
 
@@ -647,7 +647,7 @@ Panel {
               textFormat: Text.PlainText
               x: Style.space(18)
               width: parent.width - Style.space(18)
-              text: "omarchy bar set andrew.homekit host <your-mac>"
+              text: "omarchy bar set ca.orospakr.homekit host <your-mac>"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -664,7 +664,7 @@ Panel {
               textFormat: Text.PlainText
               width: parent.width
               text: "Stuck? Run bin/homekit-doctor <your-mac> from the plugin directory "
-                  + "(~/.config/omarchy/plugins/andrew.homekit) \u2014 it checks each step above "
+                  + "(~/.config/omarchy/plugins/ca.orospakr.homekit) \u2014 it checks each step above "
                   + "and says which one is failing. The README there has the long version."
               color: root.dim
               font.family: root.fontFamily

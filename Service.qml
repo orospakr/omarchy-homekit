@@ -45,7 +45,7 @@ Item {
 
   readonly property string invalidHostRemedy:
     "A host is a plain name, an ~/.ssh/config alias, or user@name — no leading dash, "
-    + "no spaces. Set it with: omarchy bar set andrew.homekit host <your-mac>"
+    + "no spaces. Set it with: omarchy bar set ca.orospakr.homekit host <your-mac>"
 
   // Per-user runtime dir keeps the control socket out of shared /tmp. %C is
   // ssh's hash of host/port/user, so several hosts never collide.
@@ -174,7 +174,7 @@ Item {
         } catch (e) {
           // A callback that throws must not take the job object (or the
           // `loading` flag it was going to clear) down with it.
-          console.warn("andrew.homekit: job callback threw:", e)
+          console.warn("ca.orospakr.homekit: job callback threw:", e)
         }
       }
 
@@ -197,7 +197,7 @@ Item {
         // has already been answered by the watchdog).
         onRunningChanged: {
           if (proc.running || job.launched || job.finished) return
-          console.warn("andrew.homekit: ssh failed to start:", String(proc.command))
+          console.warn("ca.orospakr.homekit: ssh failed to start:", String(proc.command))
           job.finish(-1, "", "ssh could not be started on this machine")
           job.destroy()
         }
@@ -214,7 +214,7 @@ Item {
         interval: 30000
         running: proc.running && !job.finished
         onTriggered: {
-          console.warn("andrew.homekit: ssh job timed out after 30s:", String(proc.command))
+          console.warn("ca.orospakr.homekit: ssh job timed out after 30s:", String(proc.command))
           job.finish(-1, "", "timed out")
           proc.running = false
           hardKill.restart()
@@ -236,7 +236,7 @@ Item {
         interval: 3000
         onTriggered: {
           if (!proc.running) return
-          console.warn("andrew.homekit: ssh job ignored SIGTERM, sending SIGKILL:", String(proc.command))
+          console.warn("ca.orospakr.homekit: ssh job ignored SIGTERM, sending SIGKILL:", String(proc.command))
           proc.signal(9)
         }
       }
@@ -246,13 +246,13 @@ Item {
   function runJob(args, callback) {
     var command = Model.sshArgs(root.sshHost, root.cliPath, args, root.controlPath)
     if (!command) {
-      console.warn("andrew.homekit: refusing to run ssh for an unusable host")
+      console.warn("ca.orospakr.homekit: refusing to run ssh for an unusable host")
       if (callback) callback(-1, "", "invalid host")
       return null
     }
     var job = jobComponent.createObject(root, { command: command })
     if (!job) {
-      console.warn("andrew.homekit: could not create ssh process for", args.join(" "))
+      console.warn("ca.orospakr.homekit: could not create ssh process for", args.join(" "))
       if (callback) callback(-1, "", "could not start ssh")
       return null
     }
@@ -550,7 +550,7 @@ Item {
           failure = Model.classifyFailure(exitCode, err, endpointHost, endpointCli)
         }
       } catch (e) {
-        console.warn("andrew.homekit: reading the accessory list threw:", e)
+        console.warn("ca.orospakr.homekit: reading the accessory list threw:", e)
         if (!failure) failure = { kind: "cli", message: "Could not read the accessory list", remedy: "" }
       } finally {
         settle()
@@ -581,7 +581,7 @@ Item {
           failure = Model.classifyFailure(exitCode, err, endpointHost, endpointCli)
         }
       } catch (e) {
-        console.warn("andrew.homekit: reading scenes threw:", e)
+        console.warn("ca.orospakr.homekit: reading scenes threw:", e)
         if (!failure) failure = { kind: "cli", message: "Could not read the scene list", remedy: "" }
       } finally {
         settle()
