@@ -404,7 +404,8 @@ what valid JSON may become: at most 1024 accessories, 512 scenes, 12 readings
 per accessory, and 512 characters per label reach the UI. Every remote call,
 in the widget and the doctor both, runs under a hard deadline with a
 TERM-then-KILL reaping path, and there is a global ceiling on concurrent ssh
-processes, so no IPC caller can pile them up without bound.
+processes — a slot frees only when its child is actually reaped, not when the
+caller is answered — so no IPC caller can pile them up without bound.
 
 **Open-only polling.** Reads run when the panel opens and on a timer while it
 stays open. An SSH round trip per tick behind a closed panel would be absurd,

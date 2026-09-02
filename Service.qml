@@ -176,13 +176,28 @@ Item {
       readonly property int stdoutLimit: 4 * 1024 * 1024
       readonly property int stderrLimit: 256 * 1024
 
+      // The concurrency slot counts a live child process, not caller
+      // bookkeeping: a job that times out or overflows has its callback
+      // answered immediately (finish below), but its slot comes back only
+      // once the child is actually gone — onExited, which SIGKILL guarantees
+      // within the 3 s grace, or the failed-to-start path, where no child
+      // ever existed. Releasing inside finish() let an IPC caller refill all
+      // six slots while six terminated-but-still-dying ssh processes
+      // lingered, which defeated the ceiling.
+      property bool slotReleased: false
+      function releaseSlot() {
+        if (job.slotReleased) return
+        job.slotReleased = true
+        root.activeJobs = Math.max(0, root.activeJobs - 1)
+      }
+
       // The single place a callback is allowed to run, so the watchdog, an
       // overflow and a real exit can race without the caller's bookkeeping
-      // running twice.
+      // running twice. Deliberately does NOT release the concurrency slot —
+      // that belongs to the child's actual lifetime, above.
       function finish(exitCode, out, err) {
         if (job.finished) return
         job.finished = true
-        root.activeJobs = Math.max(0, root.activeJobs - 1)
         var cb = job.callback
         job.callback = null
         if (!cb) return
@@ -220,6 +235,7 @@ Item {
           try {
             job.finish(exitCode, String(jobOut.text || ""), String(jobErr.text || ""))
           } finally {
+            job.releaseSlot()
             job.destroy()
           }
         }
@@ -231,6 +247,7 @@ Item {
           if (proc.running || job.launched || job.finished) return
           console.warn("ca.orospakr.homekit: ssh failed to start:", String(proc.command))
           job.finish(-1, "", "ssh could not be started on this machine")
+          job.releaseSlot()
           job.destroy()
         }
       }

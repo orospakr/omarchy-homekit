@@ -715,22 +715,42 @@ ok "homeclaw-cli is executable at $cli_path"
 
 # ------------------------------------------------ 5. HomeClaw itself answers
 
-err_file=$(mktemp) || die "Cannot create a temporary file" "Check /tmp and \$TMPDIR."
-trap 'rm -f "$err_file"' EXIT
+# A private working directory for the captures below: mktemp -d creates it
+# 0700, and the chmod re-asserts that rather than trusting the default. The
+# files inside only ever hold bounded remote text, but they still do not
+# belong somewhere another local user can even name.
+tmp_dir=$(mktemp -d) || die "Cannot create a temporary directory" "Check /tmp and \$TMPDIR."
+chmod 700 "$tmp_dir" || die "Cannot restrict the temporary directory" "Check /tmp and \$TMPDIR."
+trap 'rm -rf "$tmp_dir"' EXIT
+err_file="$tmp_dir/stderr"
+rc_file="$tmp_dir/rc"
 
 # One read, run exactly as the widget runs it, with stdout, stderr and exit
 # status kept apart: a transport failure, a CLI refusal and a well-formed reply
 # of the wrong shape each need a different remedy.
 #
-# Both captures are bounded on this side. With pipefail set, a genuine ssh/CLI
-# failure survives the pipe into $?; an endpoint that overruns the stdout
-# ceiling has ssh cut off mid-stream (SIGPIPE), which reads as the transport
-# failure it is. Stderr is bounded when it is read back out of the file.
+# Both streams are bounded WHILE THE PRODUCER RUNS, not on read-back: stdout
+# flows through the outer head, stderr through the inner one, and each head
+# stops accepting at its ceiling — past it, ssh's next write gets SIGPIPE and
+# dies, so an endpoint that overruns a quota reads as the transport failure it
+# is, and nothing beyond either ceiling is buffered to memory or disk. ssh's
+# own exit status would be lost behind the pipes, so the inner pipeline's
+# PIPESTATUS[0] is carried out through a file in the private directory; both
+# heads have finished before the substitution returns, so neither file is
+# racing anything when it is read.
 capture() {
-  cap_out=$(run_ssh "$host" "$(rquote "$cli_path")" "$@" 2>"$err_file" |
-    head -c "$REMOTE_STDOUT_LIMIT")
-  cap_rc=$?
-  cap_err=$(head -c "$REMOTE_STDERR_LIMIT" "$err_file")
+  cap_out=$(
+    {
+      run_ssh "$host" "$(rquote "$cli_path")" "$@" 2>&1 1>&3 |
+        head -c "$REMOTE_STDERR_LIMIT" >"$err_file"
+      printf '%s' "${PIPESTATUS[0]}" >"$rc_file"
+    } 3>&1 | head -c "$REMOTE_STDOUT_LIMIT"
+  )
+  cap_rc=$(<"$rc_file")
+  # The rc travelled through a file; a value that is not a plain number never
+  # reaches an arithmetic context or a report line.
+  is_count "$cap_rc" || cap_rc=1
+  cap_err=$(<"$err_file")
 }
 
 capture 'status' '--json'
