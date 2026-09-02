@@ -5,9 +5,12 @@ import "Model.js" as Model
 
 // SSH/CLI data layer for the HomeKit panel.
 //
-// Every HomeKit call is one `ssh <host> homeclaw-cli …` invocation, launched
-// as an argv array so nothing on this side is ever handed to a local shell
-// (Model.quote handles the *remote* shell, which ssh unavoidably interposes).
+// Every HomeKit call is one `ssh <host> homeclaw-cli …` invocation, run
+// behind the bin/homekit-transport relay (byte ceilings on both streams and
+// a TERM-then-KILL deadline) and launched as an argv array so no remote data
+// is ever handed to a local shell for parsing (Model.quote handles the
+// *remote* shell, which ssh unavoidably interposes; the relay itself only
+// pipes remote bytes, never interprets them).
 // Reads run only while the panel is open — an SSH round trip per tick is far
 // too heavy to leave running behind a closed panel, and the bar icon needs no
 // live accessory state.
@@ -47,16 +50,18 @@ Item {
     "A host is a plain name, an ~/.ssh/config alias, or user@name — no leading dash, "
     + "no spaces. Set it with: omarchy bar set ca.orospakr.homekit host <your-mac>"
 
-  // The control socket lives only in the per-user runtime directory (0700 by
-  // the XDG spec). No XDG_RUNTIME_DIR means no acceptable place for it — the
-  // old fallback was shared /tmp, a predictable path another local user could
-  // claim first — so the empty string tells Model.sshArgs to skip multiplexing
-  // entirely: slower, never a shared socket. %C is ssh's hash of
-  // host/port/user, so several hosts never collide.
-  readonly property string controlPath: {
-    var dir = Quickshell.env("XDG_RUNTIME_DIR")
-    return dir ? dir + "/homekit-ssh-%C" : ""
-  }
+  // Every remote byte enters the shell process through this relay, which
+  // enforces the stdout/stderr ceilings while ssh is producing and runs the
+  // whole call under a TERM-then-KILL deadline. QML's StdioCollector appends
+  // a chunk to its retained text before any handler can measure it, so a
+  // ceiling checked in QML is a guard after the allocation — the relay is the
+  // actual bound, and the collectors below only ever retain what it let
+  // through. A healthy `list --json` is tens of kilobytes.
+  readonly property string transportPath:
+    String(Qt.resolvedUrl("bin/homekit-transport")).replace(/^file:\/\//, "")
+  readonly property int stdoutLimitBytes: 4 * 1024 * 1024
+  readonly property int stderrLimitBytes: 256 * 1024
+  readonly property int remoteDeadlineSeconds: 30
 
   // ---------------------------------------------------------------- state
   property var rawAccessories: []
@@ -168,14 +173,6 @@ Item {
       property alias command: proc.command
       property alias running: proc.running
 
-      // Producer-side ceilings on what the far side may stream back. A healthy
-      // `list --json` is tens of kilobytes; a compromised or wedged endpoint
-      // used to be able to stream until this process exhausted memory, because
-      // the collectors buffered without limit. Counted in UTF-16 units, which
-      // is exact for ASCII JSON and never undercounts bytes by more than 2x.
-      readonly property int stdoutLimit: 4 * 1024 * 1024
-      readonly property int stderrLimit: 256 * 1024
-
       // The concurrency slot counts a live child process, not caller
       // bookkeeping: a job that times out or overflows has its callback
       // answered immediately (finish below), but its slot comes back only
@@ -210,26 +207,14 @@ Item {
         }
       }
 
-      // The collectors update `text` as data arrives (waitForEnd off) so the
-      // ceiling is enforced while the remote is still streaming — the job is
-      // terminated at the limit, not after buffering whatever the peer felt
-      // like sending. At a normal exit the stream has ended before onExited
-      // fires, so `text` is complete exactly as it was under waitForEnd.
-      function enforceCeiling() {
-        if (job.finished) return
-        if (jobOut.text.length <= job.stdoutLimit && jobErr.text.length <= job.stderrLimit) return
-        console.warn("ca.orospakr.homekit: remote output exceeded the size ceiling, terminating:",
-                     String(proc.command))
-        job.finish(-1, "", "the remote endpoint sent more output than this widget will read")
-        proc.running = false
-        hardKill.restart()
-      }
-
+      // Plain collectors: the byte ceilings live in the homekit-transport
+      // relay in front of ssh, so these can never retain more than the quotas
+      // it lets through, and `text` is complete when onExited fires.
       Process {
         id: proc
         running: false
-        stdout: StdioCollector { id: jobOut; waitForEnd: false; onTextChanged: job.enforceCeiling() }
-        stderr: StdioCollector { id: jobErr; waitForEnd: false; onTextChanged: job.enforceCeiling() }
+        stdout: StdioCollector { id: jobOut; waitForEnd: true }
+        stderr: StdioCollector { id: jobErr; waitForEnd: true }
         onStarted: job.launched = true
         onExited: function(exitCode, exitStatus) {
           try {
@@ -252,18 +237,20 @@ Item {
         }
       }
 
-      // ConnectTimeout only covers the handshake. A HomeClaw or remote shell
-      // that hangs *after* connecting would otherwise leave `loading` or a
-      // row's busy state set forever, so every job has a hard deadline: the
-      // caller is told it timed out and the child is terminated (setting
-      // running to false is Quickshell's terminate), which lands in onExited
-      // and destroys the object.
+      // The authoritative deadline lives in the relay (`timeout -k 5 30`
+      // parents ssh directly, so the subtree is reaped on time even if this
+      // process tree is torn down out of order). This timer is only the
+      // backstop for the one process the relay cannot reap — the relay's own
+      // shell wedging — so it fires after the relay's deadline plus its KILL
+      // grace has already passed. The caller is told, and the child is
+      // terminated (setting running to false is Quickshell's terminate),
+      // which lands in onExited and destroys the object.
       Timer {
         id: watchdog
-        interval: 30000
+        interval: 40000
         running: proc.running && !job.finished
         onTriggered: {
-          console.warn("ca.orospakr.homekit: ssh job timed out after 30s:", String(proc.command))
+          console.warn("ca.orospakr.homekit: job outlived the relay deadline:", String(proc.command))
           job.finish(-1, "", "timed out")
           proc.running = false
           hardKill.restart()
@@ -298,12 +285,18 @@ Item {
   property int activeJobs: 0
 
   function runJob(args, callback) {
-    var command = Model.sshArgs(root.sshHost, root.cliPath, args, root.controlPath)
-    if (!command) {
+    var sshCommand = Model.sshArgs(root.sshHost, root.cliPath, args)
+    if (!sshCommand) {
       console.warn("ca.orospakr.homekit: refusing to run ssh for an unusable host")
       if (callback) callback(-1, "", "invalid host")
       return null
     }
+    var command = [
+      root.transportPath,
+      String(root.stdoutLimitBytes),
+      String(root.stderrLimitBytes),
+      String(root.remoteDeadlineSeconds)
+    ].concat(sshCommand)
     if (root.activeJobs >= root.maxConcurrentJobs) {
       console.warn("ca.orospakr.homekit: refusing ssh job,", root.activeJobs, "already running")
       if (callback) callback(-1, "", "too many HomeKit calls at once; try again in a moment")

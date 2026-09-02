@@ -237,10 +237,8 @@ omarchy plugin remove ca.orospakr.homekit
 
 That disables the widget and deletes
 `~/.config/omarchy/plugins/ca.orospakr.homekit`. The plugin keeps no other state
-on this machine — the one thing it leaves behind is the multiplexed ssh
-control socket in `$XDG_RUNTIME_DIR`, which expires on its own within five
-minutes (`ControlPersist=300`). Nothing on the Mac was installed by the
-widget, so there is nothing to undo there.
+on this machine, and nothing on the Mac was installed by the widget, so there
+is nothing to undo there.
 
 ### 4. Verify
 
@@ -274,8 +272,8 @@ rather than eyeballing the reply with a regex: "starts with a `[`" is not the
 same as "is a JSON array", and a run that cannot verify the replies is not
 allowed to print "All checks passed".
 
-The doctor uses the same ssh options the widget does, so a passing run also
-leaves a warm multiplexed connection behind for the panel's first open. It
+The doctor uses the same ssh options the widget does, so what it proves is
+exactly what the widget will do. It
 treats everything coming back from the Mac as hostile input: counts are
 type-checked before they are compared, a reply of the wrong shape fails the
 step it came from, a setting carrying control characters is refused rather than
@@ -386,24 +384,26 @@ machine. So both command builders put `--` before the host, and both refuse a
 no real destination looks like that, and a settings file is not a trusted
 input.
 
-**Connection multiplexing.** A cold handshake to the Mac costs about a second,
-and a refresh is two calls with a third following every write. `ControlMaster`
-with a 5-minute `ControlPersist` collapses them onto one connection, so only
-the first call after a lull pays for a handshake. The doctor deliberately uses
-the identical option list (kept in sync by hand, with a comment on both sides)
-so that what it proves is exactly what the widget will do — control socket
-included. That socket lives only in the per-user `XDG_RUNTIME_DIR` (0700 by
-the XDG spec; the doctor verifies ownership and mode, since bash can): with no
-such directory, multiplexing is skipped entirely rather than falling back to a
-predictable path in shared `/tmp`.
+**No connection reuse.** A cold handshake to the Mac costs about a second, and
+`ControlMaster` would amortize it — but its background master is a daemonized
+ssh that nothing in the widget can own: `ControlPersist` keeps it alive after
+the client exits, outside the widget's process cap, its deadlines, and its
+endpoint invalidation, lingering across a host change or an unload. Rather
+than build a race-safe lifecycle around a process designed to escape one, the
+widget pays for its connections: every call is one self-contained ssh whose
+entire lifetime is tracked, deadlined, and counted. The handshake lands behind
+an open panel that is rendering the previous model while it happens. The
+doctor uses the identical option list (kept in sync by hand, with a comment on
+both sides) so that what it proves is exactly what the widget will do.
 
 **Bounded input.** Everything the Mac sends is capped before it is believed.
-The transport reads at most 4 MiB of stdout and 256 KiB of stderr per call —
-an endpoint that exceeds that is terminated, not buffered — and the model caps
-what valid JSON may become: at most 1024 accessories, 512 scenes, 12 readings
-per accessory, and 512 characters per label reach the UI. Every remote call,
-in the widget and the doctor both, runs under a hard deadline with a
-TERM-then-KILL reaping path, and there is a global ceiling on concurrent ssh
+Every call runs behind `bin/homekit-transport`, a byte-limited relay that
+passes through at most 4 MiB of stdout and 256 KiB of stderr and runs the
+whole call under a TERM-then-KILL deadline; past a quota the producer dies on
+SIGPIPE and the call fails, so nothing beyond the ceilings is ever allocated
+in the shell process. The model then caps what valid JSON may become: at most
+1024 accessories, 512 scenes, 12 readings per accessory, and 512 characters
+per label reach the UI. And there is a global ceiling on concurrent ssh
 processes — a slot frees only when its child is actually reaped, not when the
 caller is answered — so no IPC caller can pile them up without bound.
 

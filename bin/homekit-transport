@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+#
+# homekit-transport — byte-limited relay between the widget and ssh.
+#
+#   homekit-transport <stdout-limit> <stderr-limit> <deadline-seconds> <cmd...>
+#
+# QML's StdioCollector appends a chunk to its retained text BEFORE any signal
+# handler can measure it, so a ceiling enforced in QML is a guard after the
+# allocation, not a bound on it. This relay is the bound: it sits between the
+# shell process and ssh, passes at most <stdout-limit> bytes of stdout and
+# <stderr-limit> bytes of stderr through to the widget, and runs the whole
+# command under a TERM-then-KILL deadline. The widget only ever parses what
+# came out of this relay, so nothing a hostile endpoint streams can allocate
+# past the quotas in the shell process.
+#
+# Overflow is a failure, not a truncation that parses: `head -c` stops
+# accepting at the quota, the producer's next write dies on SIGPIPE (exit
+# 141), and a JSON reply cut mid-stream does not parse — the widget reports
+# the failure rather than rendering half a home.
+#
+# The command's own exit status is what the widget's failure triage keys on
+# (ssh's 255 vs the CLI's 64 and so on), so it is carried out through the
+# inner pipeline's PIPESTATUS rather than lost behind the relays.
+#
+# Teardown is bounded by construction: `timeout` is the direct parent of the
+# command and reaps its subtree at the deadline (KILL 5 s after TERM) even if
+# this bash process is itself killed first, so no descendant can outlive the
+# deadline regardless of which process dies in what order.
+#
+# Everything here is a trusted argv from the widget — nothing remote is ever
+# parsed by this shell; remote bytes only flow through pipes.
+
+set -uo pipefail
+
+fail() { printf 'homekit-transport: %s\n' "$1" >&2; exit 66; }
+
+command -v timeout >/dev/null 2>&1 || fail "coreutils 'timeout' is required"
+[[ $# -ge 4 ]] || fail "usage: homekit-transport <stdout-limit> <stderr-limit> <deadline-s> <cmd...>"
+
+out_limit=$1
+err_limit=$2
+deadline=$3
+shift 3
+
+[[ $out_limit =~ ^[0-9]+$ ]] || fail "stdout limit is not a number"
+[[ $err_limit =~ ^[0-9]+$ ]] || fail "stderr limit is not a number"
+[[ $deadline =~ ^[0-9]+$ ]] || fail "deadline is not a number"
+
+# fd swap: the command's stderr goes down the inner pipe into its relay and
+# back out as this process's stderr; its stdout rides fd 3 into the outer
+# relay and out as this process's stdout. Same shape the doctor's capture()
+# uses, streaming instead of capturing.
+{
+  timeout -k 5 "$deadline" "$@" 2>&1 1>&3 |
+    head -c "$err_limit" 1>&2
+  exit "${PIPESTATUS[0]}"
+} 3>&1 | head -c "$out_limit"
+exit "${PIPESTATUS[0]}"

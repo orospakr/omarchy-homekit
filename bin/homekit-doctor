@@ -31,29 +31,16 @@ DEFAULT_CLI_PATH="/Applications/HomeClaw.app/Contents/MacOS/homeclaw-cli"
 REMOTE_STDOUT_LIMIT=$((4 * 1024 * 1024))
 REMOTE_STDERR_LIMIT=$((256 * 1024))
 
-# Keep this list in sync with Model.sshArgs() in Model.js. It is copied verbatim
-# rather than trimmed so the doctor exercises the exact transport the widget
-# uses — including the control socket, which means a successful run also leaves
-# a warm master connection behind for the panel.
+# Keep this list in sync with Model.sshArgs() in Model.js. It is copied
+# verbatim rather than trimmed so the doctor exercises the exact transport the
+# widget uses. Deliberately no ControlMaster: its background master is a
+# daemonized process nothing here owns — it would outlive this script (and the
+# widget's process accounting) by up to ControlPersist — so every call simply
+# pays its own handshake, exactly as the widget does.
 ssh_opts=(
   -o BatchMode=yes
   -o ConnectTimeout=5
 )
-
-# Multiplexing goes through the per-user runtime directory or not at all,
-# exactly as the widget decides it (Service.qml trusts XDG_RUNTIME_DIR's
-# spec-guaranteed 0700 mode; bash can actually verify ownership and mode, so
-# it does). Without a validated owner-only directory there is no ControlMaster
-# — the old fallback was shared /tmp, a predictable path another local user
-# could claim first — and every call simply pays its own handshake.
-if [[ -n ${XDG_RUNTIME_DIR:-} && -d ${XDG_RUNTIME_DIR:-} && -O ${XDG_RUNTIME_DIR:-} ]] &&
-   [[ $(stat -c %a -- "${XDG_RUNTIME_DIR}" 2>/dev/null) == 700 ]]; then
-  ssh_opts+=(
-    -o ControlMaster=auto
-    -o "ControlPath=${XDG_RUNTIME_DIR}/homekit-ssh-%C"
-    -o ControlPersist=300
-  )
-fi
 
 # ----------------------------------------------------------------- output
 

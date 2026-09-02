@@ -34,33 +34,28 @@ function hostIsValid(host) {
   return true
 }
 
-// Multiplexing matters here: a cold SSH handshake to the Mac costs ~1s, and a
-// panel refresh is two calls with a third following every write. ControlMaster
-// collapses them onto one connection that lingers for five minutes.
+// Deliberately NOT multiplexed. ControlMaster would save the ~1s handshake on
+// every call after the first, but its background master is a process nothing
+// here can own: ControlPersist daemonizes it past the client's exit, so it
+// escapes the widget's process accounting (the global job cap, the deadlines,
+// endpoint invalidation) and lingers after a host change or an unload. Every
+// call is instead one self-contained ssh whose entire lifetime is tracked;
+// the handshake is paid behind an open panel that is rendering the previous
+// model anyway.
 //
 // Returns null for a host this must not be handed to ssh at all; the caller
 // treats that as "cannot start" rather than launching something.
-function sshArgs(host, cliPath, args, controlPath) {
+function sshArgs(host, cliPath, args) {
   if (!hostIsValid(host)) return null
   var command = [
     "ssh",
     "-o", "BatchMode=yes",
-    "-o", "ConnectTimeout=5"
+    "-o", "ConnectTimeout=5",
+    // Ends option parsing: belt and braces beside hostIsValid above.
+    "--",
+    String(host),
+    quote(cliPath)
   ]
-  // No control path means no private per-user runtime directory to keep the
-  // socket in. The old fallback was shared /tmp — a predictable path another
-  // local user could claim first — so multiplexing is simply not used then:
-  // every call pays its own handshake rather than trusting a shared directory.
-  var control = String(controlPath === undefined || controlPath === null ? "" : controlPath)
-  if (control !== "") {
-    command.push(
-      "-o", "ControlMaster=auto",
-      "-o", "ControlPath=" + control,
-      "-o", "ControlPersist=300"
-    )
-  }
-  // `--` ends option parsing: belt and braces beside hostIsValid above.
-  command.push("--", String(host), quote(cliPath))
   for (var i = 0; i < args.length; i++) command.push(quote(args[i]))
   return command
 }
@@ -718,6 +713,12 @@ function classifyFailure(exitCode, stderr, host, cliPath) {
 
   if (exitCode === 127 || lower.indexOf("no such file") >= 0 || lower.indexOf("command not found") >= 0)
     return { kind: "cli-missing", message: "homeclaw-cli not found on " + host, remedy: cliRemedy(cliPath) }
+
+  // 141 = died on SIGPIPE, which in this transport means the relay's byte
+  // ceiling cut the stream off: the endpoint sent more than the widget will
+  // read. Said plainly, because "homeclaw-cli exited 141" helps nobody.
+  if (exitCode === 141)
+    return { kind: "cli", message: "The reply from " + host + " exceeded the widget's size limit", remedy: "" }
 
   if (lower.indexOf("socket") >= 0 || lower.indexOf("not running") >= 0
       || lower.indexOf("could not connect") >= 0 || lower.indexOf("couldn't connect") >= 0
