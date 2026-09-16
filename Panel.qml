@@ -69,8 +69,14 @@ Panel {
     return false
   }
 
+  // Omarchy 4.0.3+ hands third-party widgets a PluginBarApi facade whose
+  // centerHoverRevealSuppressed is read-only; assigning it throws and aborts
+  // close(), leaving the panel stuck open. Prefer the setter, fall back to the
+  // old direct assignment for older shells that still inject the real Bar.
   function setCenterHoverRevealSuppressed(value) {
-    if (root.bar && "centerHoverRevealSuppressed" in root.bar)
+    if (root.bar && typeof root.bar.setCenterHoverRevealSuppressed === "function")
+      root.bar.setCenterHoverRevealSuppressed(value)
+    else if (root.bar && "centerHoverRevealSuppressed" in root.bar)
       root.bar.centerHoverRevealSuppressed = value
   }
 
